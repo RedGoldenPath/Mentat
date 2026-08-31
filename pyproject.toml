@@ -1,0 +1,26 @@
+[project]
+name = "secondbrain"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ebooklib>=0.20",
+    "lightrag-hku>=1.5.6",
+    "mcp>=2.1.1",
+    "ollama>=0.6.2",
+    "openai>=3.6.0",
+    "pyfiglet>=1.0.4",
+    "pymupdf>=1.28.2",
+    "pypdf>=6.16.2",
+    "python-docx>=1.2.0",
+    "rich>=15.0.0",
+    "textual>=8.2.8",
+]
+
+[project.scripts]
+secondbrain = "secondbrain:main"
+
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13.0"]
+build-backend = "uv_build"
