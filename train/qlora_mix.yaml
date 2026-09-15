@@ -1,0 +1,27 @@
+# M4b — dialectical-thinking adapter over the default register.
+# Trains on the mixed set (default answers + dialectical reasoning traces) so
+# the model THINKS dialectically for interpretive questions while keeping
+# quote/count answers strict. Window 3072 (the 248k-vocab logits head makes
+# longer windows exceed this 48GB box; the chunked patch handles the rest).
+model: models/qwen3.8-27b-4bit
+train: true
+data: data_mix
+seed: 42
+fine_tune_type: lora
+num_layers: 16
+batch_size: 1
+iters: 300
+val_batches: 4
+learning_rate: 1.0e-5
+steps_per_report: 10
+steps_per_eval: 100
+save_every: 50
+clear_cache_threshold: 8
+adapter_path: adapters/mentat-dialectic
+max_seq_length: 1536
+mask_prompt: true
+grad_checkpoint: true
+lora_parameters:
+  rank: 16
+  dropout: 0.05
+  scale: 16.0

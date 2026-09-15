@@ -11,7 +11,7 @@ from mcp.server.mcpserver import MCPServer
 
 from brain_core import Brain, SETTINGS_DEFAULTS
 
-server = MCPServer("secondbrain")
+server = MCPServer("mentat")
 _brain = None
 _brain_lock = asyncio.Lock()
 
@@ -28,7 +28,7 @@ async def _get_brain():
     name="index_knowledge",
     title="Index the knowledge folder",
     description=(
-        "Scan the second-brain knowledge folder for new or changed files and "
+        "Scan the Mentat knowledge folder for new or changed files and "
         "incrementally add them to the knowledge graph. Use this for large "
         "additions such as books (indexing many files can take a while)."
     ),
@@ -71,15 +71,81 @@ async def ask_brain(question: str, mode: str = "") -> str:
 
 
 @server.tool(
+    name="find_quote",
+    title="Hunt a half-remembered quote",
+    description=(
+        "Fuzzy + exact quote hunt across every indexed book. Use when the user "
+        "half-remembers a line and wants the quote, book, and chapter back. "
+        "Returns verbatim passages with their sources."
+    ),
+)
+async def find_quote(question: str, limit: int = 12) -> str:
+    from brain_core import _citation_for, _hunt_passages
+
+    hits = _hunt_passages(str(question or ""), limit=max(1, min(int(limit or 12), 40)))
+    passages = [
+        {
+            "source": _citation_for(h) or h.get("file_path", ""),
+            "span_anchored": bool(h.get("span")),
+            "excerpt": (h.get("excerpt") or "")[:700],
+        }
+        for h in hits
+    ]
+    return json.dumps(
+        {"status": "ok", "hits": len(passages), "passages": passages},
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+@server.tool(
+    name="entity_graph",
+    title="Entity co-occurrence graph",
+    description=(
+        "What names and ideas co-occur with a given entity across the indexed "
+        "library, and in which books. Use for concept mapping and cross-book "
+        "synthesis."
+    ),
+)
+async def entity_graph(entity: str, limit: int = 15) -> str:
+    from brain_core import _graph_related
+
+    info = _graph_related(str(entity or ""), limit=max(1, min(int(limit or 15), 40)))
+    return json.dumps(info, ensure_ascii=False, indent=2)
+
+
+@server.tool(
+    name="verify_system",
+    title="Run the verification suite",
+    description=(
+        "Run Mentat's self-test suite (index integrity, census, quote hunt, "
+        "enrichment, graph, routing). Results are appended to the research "
+        "diary. Use after indexing or when something looks wrong."
+    ),
+)
+async def verify_system(quick: bool = True) -> str:
+    import asyncio as _asyncio
+
+    from verify import run_suite
+
+    results = await _asyncio.to_thread(run_suite, bool(quick), False)
+    passed = sum(1 for r in results if r.get("status") == "PASS")
+    failed = [r["check"] for r in results if r.get("status") != "PASS"]
+    return json.dumps(
+        {"passed": passed, "total": len(results), "failed": failed},
+        indent=2,
+    )
+
+
+@server.tool(
     name="brain_settings",
     title="View or change brain settings",
     description=(
         "View or change settings. To view: call with no arguments. To change: set "
-        "set_key and set_value. Valid keys: thinking (false/true/low/medium/high), "
-        "history_turns (int), mode (naive/local/global/hybrid/mix), model "
-        "(deepseek-chat=default / deepseek-think / qwen=offline / any model name), "
-        "temperature (0-2 or none), top_k (int), chunk_top_k (int), lens (free text "
-        "framing injected into every answer)."
+        "set_key and set_value. Models may be preset keys (deepseek-flash, "
+        "deepseek-think, kimi-k3, qwen, qwen-deep) or provider-prefixed ids "
+        "(openrouter/…, moonshot/…, deepseek/…). Run `mentat settings` for the "
+        "full debug menu with descriptions."
     ),
 )
 async def brain_settings(set_key: str = "", set_value: str = "") -> str:
@@ -158,7 +224,7 @@ async def index_status() -> str:
 @server.tool(
     name="brain_history",
     title="Show conversation history",
-    description="Return the most recent past questions and answers from the second brain, newest last. Optionally set a limit (default 10).",
+    description="Return the most recent past questions and answers from Mentat, newest last. Optionally set a limit (default 10).",
 )
 async def brain_history(limit: int = 10) -> str:
     brain = await _get_brain()
@@ -188,6 +254,45 @@ async def delete_document(path: str) -> str:
     async with _brain_lock:
         result = await brain.forget(path)
     return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+@server.tool(
+    name="library_stats",
+    title="Statistics about what is in the index",
+    description=(
+        "Per-book inventory statistics for the whole library: for each work, the "
+        "number of indexed chunks, story chapters, front/back-matter sections, and "
+        "words, plus library-wide totals. Set refresh=True to force a rebuild of "
+        "the cached profile. This answers questions like 'what books do I have', "
+        "'how big is each book', or 'how much have I indexed'."
+    ),
+)
+async def library_stats(refresh: bool = False) -> str:
+    from brain_core import _library_profiles
+
+    data = _library_profiles(refresh=refresh)
+    return json.dumps(data, indent=2, ensure_ascii=False)
+
+
+@server.tool(
+    name="term_frequency",
+    title="Count occurrences of a word or phrase per book",
+    description=(
+        "Exact whole-word/phrase occurrence counts per book (story text vs "
+        "front/back matter separately) for a word or short phrase. Answers "
+        "questions like 'how many times does melange appear in Dune', 'where "
+        "does X occur', or 'which books mention Y at all'."
+    ),
+)
+async def term_frequency(term: str) -> str:
+    from brain_core import _term_frequency
+
+    rows = _term_frequency(term)
+    return json.dumps(
+        {"term": term, "per_book": rows},
+        indent=2,
+        ensure_ascii=False,
+    )
 
 
 def main():

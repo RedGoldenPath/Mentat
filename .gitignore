@@ -17,3 +17,15 @@ backups/
 # Logs
 *.log
 autoindex.log
+# macOS
+.DS_Store
+
+# Training artifacts (large / derived) — never commit
+train/models/
+train/fused/
+train/adapters/
+train/data/
+train/data_final/
+train/data_dialectic/
+train/data_mix/
+train/.venv/

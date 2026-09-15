@@ -1,4 +1,4 @@
-"""Launches the Second Brain chat app (entry point for the `secondbrain` command)."""
+"""Launches the Mentat chat app (entry point for the `mentat` command)."""
 
 from pathlib import Path
 import sys
