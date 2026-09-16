@@ -86,9 +86,31 @@ def _last_synth_model():
         return ""
 
 
+_MOVEMENT = {
+    "contradiction": ("contradict", "self-contradict", "internal contradiction"),
+    "opposites": ("unity of opposite", "opposite", "opposed tendencies", "divided against"),
+    "quantity_quality": ("qualitative leap", "quantitative", "threshold", "leap"),
+    "sublation": ("sublat", "aufhebung", "aufheben", "preserved and", "cancel"),
+    "negation": ("negation of the negation", "negates"),
+    "material": ("material condition", "relations of production", "mode of production", "class "),
+    "recognition": ("recognition", "anerkennung", "acknowledg"),
+}
+_TRIAD = ("thesis, antithesis, synthesis", "thesis-antithesis-synthesis")
+
+
+def dialectic_rubric(answer):
+    """Score how much the answer actually THINKS dialectically (0-7) and flag
+    the banned triad. Measures the movement, not citation count."""
+    low = (answer or "").lower()
+    n = sum(1 for terms in _MOVEMENT.values() if any(t in low for t in terms))
+    triad = int(any(t in low for t in _TRIAD))
+    return n, triad
+
+
 def score(answer, seconds, served):
     cites = CITE_RE.findall(answer or "")
     low = (answer or "").lower()
+    movement, triad = dialectic_rubric(answer)
     return {
         "citations": len(cites),
         "ungrounded": (answer or "").count("⟪"),
@@ -96,6 +118,8 @@ def score(answer, seconds, served):
         "chars": len(answer or ""),
         "seconds": round(seconds, 1),
         "served": served,
+        "movement": movement,
+        "triad": triad,
     }
 
 
@@ -166,6 +190,9 @@ async def main():
     print(f"answered={sum(1 for r in rows if r['answer'].strip())}/{n}  "
           f"with_citations={cited}/{n}  total_citations={tot_cites}")
     print(f"ungrounded_quotes={ungr}  refused={refused}  avg_seconds={avg:.1f}")
+    mv = sum(r.get("movement", 0) for r in rows) / max(n, 1)
+    triad = sum(r.get("triad", 0) for r in rows)
+    print(f"dialectic_movement_avg={mv:.1f}/7  triad_violations={triad}")
     print(f"ollama_resident={_ollama_resident()}  system_free={_free_pct()}%")
     print(f"written: {out}")
 

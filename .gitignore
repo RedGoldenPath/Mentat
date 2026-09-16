@@ -29,3 +29,7 @@ train/data_final/
 train/data_dialectic/
 train/data_mix/
 train/.venv/
+
+# Swift build output
+MentatApp/.build/
+MentatApp/Mentat.app/

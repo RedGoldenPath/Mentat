@@ -6672,6 +6672,28 @@ def _ensure_named_coverage(final, question, results, cap_total=14):
     return (additions + final)[:cap_total]
 
 
+def _rrf_fuse(ranked_lists, k=60):
+    """Reciprocal Rank Fusion over several ranked retrieval lists.
+
+    score(chunk) = Σ_over_lists 1/(k + rank). Chunks that rank well across
+    MULTIPLE query variants rise above chunks that top only one — this is the
+    breadth fix (multi-query results were previously just concatenated in query
+    order). Set MENTAT_NO_RRF=1 to fall back to concatenation (A/B testing).
+    """
+    if os.getenv("MENTAT_NO_RRF"):
+        flat = []
+        for lst in ranked_lists:
+            flat.extend(lst or [])
+        return flat
+    scores, first = {}, {}
+    for lst in ranked_lists:
+        for rank, p in enumerate(lst or []):
+            cid = p.get("chunk_id") or id(p)
+            scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank + 1)
+            first.setdefault(cid, p)
+    return [first[c] for c in sorted(scores, key=lambda c: -scores[c])]
+
+
 async def _build_passages(rag, question, strategy):
     """Gather relevant passages across the whole index (Tier 1 + Tier 2)."""
     _RETRIEVAL_ERRORS.clear()
@@ -6720,14 +6742,16 @@ async def _build_passages(rag, question, strategy):
                 embeds[q] = np.expand_dims(e, 0)
     except Exception as exc:
         _retrieval_degrade(f"embedding: {exc}")
+    _lists = []
     for q in queries:
         try:
-            _add(await _librarian_search(
+            _lists.append(await _librarian_search(
                 rag, q, k=5,
                 embedding=embeds.get("hyde") if q == question else embeds.get(q),
             ))
         except Exception as exc:
             _retrieval_degrade(f"search: {exc}")
+    _add(_rrf_fuse(_lists))
 
     if strategy == "hunt":
         try:
