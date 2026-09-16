@@ -19,6 +19,7 @@ struct AskResponse: Decodable {
 
 @MainActor
 final class Engine: ObservableObject {
+    static let shared = Engine()
     @Published var answer: String = ""
     @Published var citations: [Citation] = []
     @Published var ungrounded: Int = 0
@@ -28,6 +29,31 @@ final class Engine: ObservableObject {
     @Published var status: String = "starting…"
 
     private let base = URL(string: "http://127.0.0.1:8765")!
+    private var engineProcess: Process?
+
+    /// Start the local engine (Python server.py) if it isn't already up, so the
+    /// app is self-contained — no terminal needed.
+    func ensureEngine() async {
+        await checkHealth()
+        guard !online else { return }
+        let appDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Everything/mentat/app")
+        let py = appDir.appendingPathComponent(".venv/bin/python")
+        let srv = appDir.appendingPathComponent("server.py")
+        guard FileManager.default.fileExists(atPath: py.path),
+              FileManager.default.fileExists(atPath: srv.path) else { return }
+        let p = Process()
+        p.executableURL = py
+        p.arguments = [srv.path, "--port", "8765"]
+        p.currentDirectoryURL = appDir
+        engineProcess = p
+        try? p.run()
+        for _ in 0..<15 {
+            try? await Task.sleep(nanoseconds: 900_000_000)
+            await checkHealth()
+            if online { break }
+        }
+    }
 
     func checkHealth() async {
         do {
@@ -148,13 +174,20 @@ struct AskView: View {
         }
         .padding(14)
         .frame(width: 480, height: 420)
-        .task { await engine.checkHealth() }
+        .task { await engine.ensureEngine() }
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        Task { @MainActor in await Engine.shared.ensureEngine() }
     }
 }
 
 @main
 struct MentatApp: App {
-    @StateObject private var engine = Engine()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @ObservedObject private var engine = Engine.shared
 
     var body: some Scene {
         MenuBarExtra("Mentat", systemImage: "eye") {
