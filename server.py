@@ -14,10 +14,13 @@ Usage:  uv run --project . python server.py [--port 8765]
 import argparse
 import asyncio
 import json
+import re
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import brain_core as bc
+
+_CITE_RE = re.compile(r"\(([^()\n]{3,90}) · ([^()\n]{1,90})\)")
 
 _loop = asyncio.new_event_loop()
 _brain = None
@@ -46,10 +49,25 @@ async def _get_brain():
 async def _ask(question, mode=None):
     brain = await _get_brain()
     res = await brain.ask(question, mode=(mode or None), lazy=True)
+    answer = res.get("answer") or ""
+    cites = [
+        {"book": m.group(1).strip(), "loc": m.group(2).strip()}
+        for m in _CITE_RE.finditer(answer)
+    ]
+    # de-dupe, keep order
+    seen, uniq = set(), []
+    for c in cites:
+        key = (c["book"].lower(), c["loc"].lower())
+        if key not in seen:
+            seen.add(key)
+            uniq.append(c)
     return {
         "status": res.get("status"),
-        "answer": res.get("answer") or "",
+        "answer": answer,
         "question": question,
+        "citations": uniq,
+        "ungrounded": answer.count("⟪"),
+        "model": bc.OLLAMA_LLM_MODEL,
     }
 
 
