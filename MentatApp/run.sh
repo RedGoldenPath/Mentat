@@ -1,9 +1,9 @@
 #!/bin/bash
-# Launch the Mentat menu-bar app, starting the local engine first if needed.
+# Launch the Mentat app. The Python engine is app-owned (EngineProcess starts it
+# on 127.0.0.1:8765), so this only builds the bundle and opens it.
+set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
-APP_DIR="$DIR/.."
-if ! curl -s http://127.0.0.1:8765/status >/dev/null 2>&1; then
-  (cd "$APP_DIR" && nohup .venv/bin/python server.py --port 8765 > /tmp/mentat_server.log 2>&1 &)
-  sleep 4
-fi
-open "$DIR/Mentat.app"
+APP="$DIR/Mentat.app"
+
+"$DIR/build.sh"
+open "$APP"

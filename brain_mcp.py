@@ -58,14 +58,17 @@ async def ask_brain(question: str, mode: str = "") -> str:
     brain = await _get_brain()
     async with _brain_lock:
         result = await brain.ask(question, mode=mode or None)
-    if result.get("status") == "needs_index":
+    # Every non-answered outcome (needs_index, indexing_running, store_stale,
+    # greeting, …) has a different shape and some have no answer/contexts/mode.
+    # Pass those through untouched instead of KeyError-ing on the missing keys.
+    if str(result.get("status") or "") != "answered":
         return json.dumps(result, indent=2, ensure_ascii=False)
     payload = {
         "status": "answered",
-        "question": result["question"],
-        "mode": result["mode"],
-        "draft_answer": result["answer"],
-        "evidence": result["contexts"],
+        "question": result.get("question", question),
+        "mode": result.get("mode") or mode or "",
+        "draft_answer": result.get("answer") or "",
+        "evidence": result.get("contexts") or [],
     }
     return json.dumps(payload, indent=2, ensure_ascii=False)
 

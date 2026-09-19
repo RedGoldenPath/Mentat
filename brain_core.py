@@ -834,6 +834,8 @@ def _search_file_texts():
 
 _VOCAB = None
 _VOCAB_KEY = None
+# term -> spelling-corrected term; invalidated with the vocabulary/index.
+_SPELL_CACHE = {}
 
 
 def _library_vocab():
@@ -859,6 +861,7 @@ def _library_vocab():
             words.update(re.findall(r"[A-Za-z][A-Za-z'-]*", text.lower()))
         _VOCAB = words
         _VOCAB_KEY = key
+        _SPELL_CACHE.clear()
     return _VOCAB
 
 
@@ -1698,6 +1701,13 @@ async def remote_llm(
                                 "completion_tokens": int(
                                     getattr(usage, "completion_tokens", 0) or 0
                                 ),
+                                # DeepSeek/provider prefix cache visibility
+                                "cache_hit_tokens": int(
+                                    getattr(usage, "prompt_cache_hit_tokens", 0) or 0
+                                ),
+                                "cache_miss_tokens": int(
+                                    getattr(usage, "prompt_cache_miss_tokens", 0) or 0
+                                ),
                             }
                     except Exception:
                         pass
@@ -1729,6 +1739,8 @@ async def remote_llm(
             _LAST_USAGE = {
                 "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
                 "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+                "cache_hit_tokens": int(getattr(usage, "prompt_cache_hit_tokens", 0) or 0),
+                "cache_miss_tokens": int(getattr(usage, "prompt_cache_miss_tokens", 0) or 0),
             }
         except Exception:
             _LAST_USAGE = {}
@@ -2173,16 +2185,20 @@ async def query_llm(prompt, system_prompt=None, history_messages=None, **kwargs)
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 
 
-_EMBED_QUERY_CACHE = {}
+_EMBED_CACHE = {}
 
 
 async def nomic_embed(texts, context="document", **kwargs):
     import ollama
 
+    # Cache both query and document embeddings: the librarian embeds the same
+    # query text as a document on every angle/sweep, so this turns ~15
+    # re-embeddings per probe into one. Keyed by context so the two prefixes
+    # never collide.
     cache_key = None
-    if context == "query" and texts:
-        cache_key = tuple(str(t) for t in texts)
-        hit = _EMBED_QUERY_CACHE.get(cache_key)
+    if texts:
+        cache_key = (context, tuple(str(t) for t in texts))
+        hit = _EMBED_CACHE.get(cache_key)
         if hit is not None:
             return hit
     prefixes = {"document": "search_document: ", "query": "search_query: "}
@@ -2200,9 +2216,9 @@ async def nomic_embed(texts, context="document", **kwargs):
                 )
                 result = np.array(data["embeddings"])
                 if cache_key is not None:
-                    if len(_EMBED_QUERY_CACHE) > 256:
-                        _EMBED_QUERY_CACHE.clear()
-                    _EMBED_QUERY_CACHE[cache_key] = result
+                    if len(_EMBED_CACHE) > 256:
+                        _EMBED_CACHE.clear()
+                    _EMBED_CACHE[cache_key] = result
                 return result
             except Exception:
                 if attempt == 2:
@@ -2218,6 +2234,32 @@ async def nomic_embed(texts, context="document", **kwargs):
 # ---------------------------------------------------------------------------
 
 _CHUNK_TEXTS = None
+_CHUNK_BY_ID = None
+_LOW_FILE_PATHS = None
+_CITATION_INDEX = None
+
+
+def _chunks_by_id():
+    """`chunk_id -> chunk`, cached per process and invalidated with `_CHUNK_TEXTS`.
+
+    `_librarian_search` runs per query angle (up to ~6/question) and used to
+    rebuild this 8k-entry dict every time.
+    """
+    global _CHUNK_BY_ID
+    if _CHUNK_BY_ID is None:
+        _CHUNK_BY_ID = {c["chunk_id"]: c for c in _load_chunk_texts()}
+    return _CHUNK_BY_ID
+
+
+def _low_file_paths():
+    """Lowercased distinct `file_path`s, cached — `_librarian_search` used to
+    rescan every chunk's path for every term on every query angle."""
+    global _LOW_FILE_PATHS
+    if _LOW_FILE_PATHS is None:
+        _LOW_FILE_PATHS = {
+            str(c.get("file_path", "")).lower() for c in _load_chunk_texts()
+        }
+    return _LOW_FILE_PATHS
 
 
 def _refresh_caches():
@@ -2226,16 +2268,24 @@ def _refresh_caches():
     Used by /refresh to pick up changes made outside the running app
     (a CLI index run, edited files, restored backups, etc.).
     """
-    global _CHUNK_TEXTS, _KNOWN_NAMES, _VOCAB, _VOCAB_KEY
+    global _CHUNK_TEXTS, _CHUNK_BY_ID, _LOW_FILE_PATHS, _CITATION_INDEX, _KNOWN_NAMES, _VOCAB, _VOCAB_KEY
     _CHUNK_TEXTS = None
+    _CHUNK_BY_ID = None
+    _LOW_FILE_PATHS = None
+    _CITATION_INDEX = None
     try:
         _HUNT_CACHE.clear()
-        _EMBED_QUERY_CACHE.clear()
+        _EMBED_CACHE.clear()
+        _SPELL_CACHE.clear()
     except Exception:
         pass
     _KNOWN_NAMES = None
     _VOCAB = None
     _VOCAB_KEY = None
+    try:
+        _LAST_ANSWER_PASSAGES.clear()
+    except Exception:
+        pass
     try:
         _fts_sync(force=True)
     except Exception:
@@ -2281,13 +2331,32 @@ def _store_ok():
     return not _STORE_STALE
 
 
+# --- SQLite tuning: memory-map the read-mostly indexes and give each connection
+# a healthy page cache. Pure I/O tuning — no schema or behaviour change. Bounded
+# by env so it can be dialed back without touching code.
+_SQLITE_MMAP_BYTES = int(os.getenv("MENTAT_SQLITE_MMAP", str(256 * 1024 * 1024)))
+_SQLITE_CACHE_KIB = int(os.getenv("MENTAT_SQLITE_CACHE_KIB", str(64 * 1024)))
+
+
+def _tune_sqlite(db, *, wal: bool = False):
+    try:
+        if wal:
+            db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA mmap_size=%d" % _SQLITE_MMAP_BYTES)
+        db.execute("PRAGMA cache_size=-%d" % _SQLITE_CACHE_KIB)
+        db.execute("PRAGMA temp_store=MEMORY")
+    except Exception:
+        pass
+    return db
+
+
 def _library_db():
     global _LIBRARY_DB
     if _LIBRARY_DB is None:
         _LIBRARY_DB = sqlite3.connect(
             str(LIBRARY_DB_PATH), check_same_thread=False
         )
-        _LIBRARY_DB.execute("PRAGMA journal_mode=WAL")
+        _tune_sqlite(_LIBRARY_DB, wal=True)
         _LIBRARY_DB.execute(
             "CREATE TABLE IF NOT EXISTS chunks ("
             "chunk_id TEXT PRIMARY KEY, file_path TEXT, book TEXT, "
@@ -2526,6 +2595,7 @@ def _fts_db():
         _FTS_DB = sqlite3.connect(
             str(STORAGE_DIR / "fts.db"), check_same_thread=False
         )
+        _tune_sqlite(_FTS_DB, wal=True)
         _FTS_DB.execute(
             "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts "
             "USING fts5(chunk_id UNINDEXED, file_path, content)"
@@ -2674,6 +2744,7 @@ def _vec_db():
     global _VEC_DB
     if _VEC_DB is None:
         _VEC_DB = sqlite3.connect(str(STORAGE_DIR / "vec.db"), check_same_thread=False)
+        _tune_sqlite(_VEC_DB)
         _VEC_DB.enable_load_extension(True)
         sqlite_vec.load(_VEC_DB)
         _VEC_DB.execute(
@@ -3036,7 +3107,7 @@ def _graph_db():
     global _GRAPH_DB
     if _GRAPH_DB is None:
         _GRAPH_DB = sqlite3.connect(str(GRAPH_DB_PATH), check_same_thread=False)
-        _GRAPH_DB.execute("PRAGMA journal_mode=WAL")
+        _tune_sqlite(_GRAPH_DB, wal=True)
         _GRAPH_DB.execute(
             "CREATE TABLE IF NOT EXISTS entities "
             "(name TEXT PRIMARY KEY, display TEXT, kind TEXT, count INTEGER)"
@@ -3483,7 +3554,23 @@ def _fix_vocab_spelling(term):
     is never touched. Book/author-name typos are already handled upstream by
     ``_resolve_name`` against the names list, so this stage never invents a
     book-name match either.
+
+    The `difflib.get_close_matches` scan over the whole vocabulary dominated the
+    retrieval hot path (`_derive_terms` runs per query angle), so results are
+    memoized per term; the cache is dropped whenever the vocabulary or indexes
+    are rebuilt.
     """
+    hit = _SPELL_CACHE.get(term)
+    if hit is not None:
+        return hit
+    out = _fix_vocab_spelling_uncached(term)
+    if len(_SPELL_CACHE) > 8192:
+        _SPELL_CACHE.clear()
+    _SPELL_CACHE[term] = out
+    return out
+
+
+def _fix_vocab_spelling_uncached(term):
     if len(term) < 3 or "'" in term or "-" in term:
         return term
     vocab = _library_vocab()
@@ -3810,7 +3897,7 @@ async def _librarian_search(rag, query, k=5, hyde_text=None, embedding=None, boo
         if emb is None:
             embed_text = hyde_text or query
             emb = await nomic_embed([embed_text], context="document")
-        chunks_by_id = {c["chunk_id"]: c for c in _load_chunk_texts()}
+        chunks_by_id = _chunks_by_id()
         try:
             _vec_sync()
         except Exception:
@@ -3839,10 +3926,9 @@ async def _librarian_search(rag, query, k=5, hyde_text=None, embedding=None, boo
     # terms (the meaningful ones) drive ranking and excerpt anchor, so
     # front-matter can't drown out the passage that actually mentions the topic.
     try:
-        chunks = _load_chunk_texts()
         terms = _derive_terms(query)
         if terms:
-            by_id = {c["chunk_id"]: c for c in chunks}
+            by_id = _chunks_by_id()
             _fts_sync()
             # Search PER TERM and union candidates: an OR across all terms lets
             # frequent terms crowd out the named entity that actually matters
@@ -3867,7 +3953,8 @@ async def _librarian_search(rag, query, k=5, hyde_text=None, embedding=None, boo
                     if cid not in seen_cids and cid in by_id:
                         seen_cids.add(cid)
                         candidates.append(by_id[cid])
-            book_terms = [t for t in terms if any(t in c["file_path"].lower() for c in chunks)]
+            paths = _low_file_paths()
+            book_terms = [t for t in terms if any(t in fp for fp in paths)]
             content_terms = [t for t in terms if t not in book_terms] or terms
             # Proper nouns in the query (capitalized, non-stopword) name a
             # specific book/author — a chunk from that book wins strongly.
@@ -4444,6 +4531,32 @@ _SCOPE_JUNK_TERMS = {
 }
 
 
+_GREETING_RE = re.compile(
+    r"^\s*(?:hi|hey+|hello+|yo|sup|hiya|howdy|hola|greetings|"
+    r"good\s+(?:morning|afternoon|evening)|what'?s\s+up|wassup|"
+    r"thanks|thank\s+you|ty|cheers|nice|cool|ok|okay|k)"
+    r"[\s!.?,]*$",
+    re.I,
+)
+
+
+def _is_greeting(question):
+    """A short greeting/pleasantry ("hello", "hi", "thanks") — reply in kind,
+    never run retrieval or the census."""
+    q = str(question or "").strip()
+    return len(q) <= 24 and bool(_GREETING_RE.match(q))
+
+
+def _greeting_reply(question):
+    q = (question or "").lower()
+    if any(w in q for w in ("thank", "ty", "cheers")):
+        return "Any time — ask whenever you're ready."
+    return (
+        "Hey. Ask me anything about your library — a book, a person, a theme, or a "
+        "question. For an exact occurrence count, ask \"count <word>\" or use /freq."
+    )
+
+
 def _has_library_wide_intent(question):
     """Counting/sweep questions that demand the WHOLE library, not named books."""
     q = (question or "").lower()
@@ -4570,7 +4683,7 @@ def _fts_scope_passages(question, book_key, limit=12):
     """Keyword-only scoped fallback: passages from one book matching the terms."""
     terms = _derive_terms(question)
     q_sections = _sections_for_kind(question, _question_kind(question))
-    by_id = {c["chunk_id"]: c for c in _load_chunk_texts()}
+    by_id = _chunks_by_id()
     out = []
     for cid in _fts_search_scoped(terms, book_key, limit=limit * 2):
         c = by_id.get(cid)
@@ -4660,6 +4773,7 @@ def _ensure_scope_coverage(final, scope, group_pool, cap_total=26, per_work=3):
 _CENSUS_PREFIX_RE = re.compile(
     r"^(?:"
     r"how many times|how many books|how many of your|how many|how often|how frequently|"
+    r"count|tally|"
     r"what is the (?:exact )?count of|what.*?count of|the number of|number of|"
     r"any mention(?:s)? of|all mentions of|mentions? of|occurrences? of|frequency of|"
     r"instances? of|which books?(?: in your library)? (?:mention|contain|use|quote|say)|"
@@ -4677,6 +4791,20 @@ _CENSUS_VERB_TAIL_RE = re.compile(
     r"comes? up|came up|is mentioned|gets mentioned|is quoted|gets quoted|mentioned|"
     r"used|featured|quoted|cited|written|referenced)\s*$",
     re.IGNORECASE,
+)
+
+# Openers that match _CENSUS_PREFIX_RE but are far too weak on their own: a bare
+# "does/did/is/are/has/have" or "where does" begins countless ordinary questions
+# ("did the revolution succeed", "is the protagonist reliable", "where does paul
+# die"). These only signal a census when the question also carries an explicit
+# counting noun or a counting verb somewhere in it.
+_CENSUS_WEAK_OPEN_RE = re.compile(r"^(?:does|do|is|are|did|has|have|where)\b", re.I)
+_CENSUS_NOUN_RE = re.compile(r"\b(?:word|phrase|term|expression)\b", re.I)
+_CENSUS_VERB_HINT_RE = re.compile(
+    r"\b(?:appear|appears|appeared|appearing|occur|occurs|occurred|occurring|"
+    r"show(?:s|ed)?\s+up|come(?:s)?\s+up|came\s+up|mention|mentions|mentioned|"
+    r"quote|quotes|quoted|cite|cites|cited|used|referenced)\b",
+    re.I,
 )
 
 _CENSUS_LOC_TAIL_RE = re.compile(
@@ -4959,9 +5087,14 @@ def _census_phrase(question):
         return None
     if not quoted:
         if len(content) == 1:
-            # a lone name/word survives when flagged ("the word melange") or
-            # when the question is unambiguously a count ("how many times does
-            # Paul appear"); a bare "did paul appear in messiah" still won't.
+            # a lone name/word survives when it is the flagged thing ("the word
+            # melange") or when the question is unambiguously a count ("how many
+            # times does Paul appear"); machinery ("how many words are in dune")
+            # and a bare "did paul appear in messiah" still won't.
+            if content[0].lower() in _CENSUS_META_WORDS and not _census_flagged(
+                q, content[0].lower()
+            ):
+                return None
             if not _census_flagged(q, content[0].lower()) and not _has_census_intent(q):
                 return None
         elif _CENSUS_META_WORDS.issuperset(t.lower() for t in content):
@@ -5053,12 +5186,58 @@ def _census_or_phrases(question):
     return out if len(out) >= 2 else []
 
 
+def _bare_term_query(question):
+    """A terse lookup that should behave like Command-F, not a question.
+
+    A single word ("fremen", "melange", "shai-hulud") or a quoted term
+    ('"eyes of the ibad"') with no sentence scaffolding means "find every
+    instance and give me a number", so it is routed to the exact full-library
+    census. Returns the term to count, or None when the input is a real
+    question (multi-word, a stopword/machinery word, a file path, etc.).
+    """
+    q = str(question or "").strip()
+    if not q or len(q) > 48:
+        return None
+    m = re.match(r'^["\u201c\u201d\'\u2018\u2019]([^"\u201c\u201d\'\u2018\u2019\n]{2,40})["\u201c\u201d\'\u2018\u2019]$', q)
+    if m:
+        term = m.group(1).strip()
+    else:
+        term = q.strip().strip("?.!;:,").strip()
+        if not term or len(term.split()) > 1:
+            return None
+        if not re.fullmatch(r"[A-Za-z][A-Za-z'\u2019\-]*", term):
+            return None
+    low = term.lower()
+    if low in _FLEX_STOPWORDS or low in _SCOPE_JUNK_TERMS or low in _CENSUS_META_WORDS:
+        return None
+    try:
+        if "/" in term or "\\" in term or os.path.exists(term):
+            return None
+    except Exception:
+        pass
+    return term
+
+
 def _has_census_intent(question):
-    q = (question or "").lower()
-    if not q or len(q.split()) < 4:
+    q = (question or "").lower().strip()
+    if not q:
         return False
+    # An explicit ask ("count fremen", "how many fremen") is honoured even for a
+    # single word; a bare word on its own is NOT a count — it answers normally.
     if _CENSUS_PREFIX_RE.match(q):
+        # A weak opener ("did the …", "is the …", "where does …") is not a count
+        # by itself — it needs a counting noun or a counting verb to qualify.
+        if not _CENSUS_WEAK_OPEN_RE.match(q) or _CENSUS_NOUN_RE.search(q) \
+                or _CENSUS_VERB_HINT_RE.search(q):
+            return True
+    if re.match(
+        r"^(?:count|tally|number of|occurrences? of|instances? of|frequency of|"
+        r"how many|how often|how frequently)\b",
+        q,
+    ):
         return True
+    if len(q.split()) < 4:
+        return False
     return any(
         w in q
         for w in (
@@ -5794,13 +5973,39 @@ def _census_block(question, strategy):
         return ""
 
 
-def _census_mismatches(answer, block):
-    """Deterministic spot-check of the answer's counts against the census.
+def _census_claim_after(text):
+    """The count a work's name is directly credited with, or None.
 
-    Looks at the text between a book mention and the word 'Chapter' (or end
-    of the line): if the model attached a number there that disagrees with
-    the census, that is flagged. Never complains about chapter numbers, and
-    stays silent when the claim is vague.
+    Only two shapes count as a claim: the title immediately followed by a
+    separator/count cue and a number ("Dune — 413", "Dune at 413", "Dune
+    counts 413", "Dune leads with 413"), or a number followed by a count
+    noun ("413 occurrences"). Chapter numbers ("…concentrates 16 in Chapter
+    17") and their chapter-name source are never treated as book totals.
+    """
+    head = re.split(r"[.;\n]|\bchapter\b", text, maxsplit=1, flags=re.I)[0]
+    m = re.match(
+        r"\s*(?:[—–\-:,]|\bat\b|\bwith\b|\bcounts?\b|\bcounted\b|\bhas\b|"
+        r"\bholds?\b|\btotals?\b|\btallies\b|\btally\b|\bis\b|\bare\b|"
+        r"\bleads?\s+with\b|\bfollowed\s+by\b)?\s*(\d[\d,]*)\b",
+        head,
+    )
+    if m and head[:m.start(1)].strip() != "":
+        return int(m.group(1).replace(",", ""))
+    m = re.search(r"\b(\d[\d,]*)\s+(?:occurrences?|times?|mentions?|"
+                  r"instances?|uses?|hits?|appearances?)\b", head, re.I)
+    if m:
+        return int(m.group(1).replace(",", ""))
+    return None
+
+
+def _census_mismatches(answer, block):
+    """Deterministic spot-check of the answer's per-book counts against census.
+
+    A number is compared only when a census work's name directly owns it
+    (see :func:`_census_claim_after`), and the longest work title always
+    wins the match, so "Dune" can never steal the number belonging to
+    "Children of Dune" or "Chapterhouse Dune". Chapter numbers and vague
+    prose are ignored, so a correct broad census answer is never flagged.
     """
     if not answer or not block:
         return []
@@ -5811,49 +6016,43 @@ def _census_mismatches(answer, block):
         m = re.match(r"- (.*?) — (\d+):", line)
         if m:
             rows.append((m.group(1).strip(), int(m.group(2))))
-    out = []
-    all_cores = [
-        t.split(" (")[0].split(".epub")[0].strip() for t, _ in rows
-    ]
-    all_cores = [c for c in all_cores if len(c) >= 3]
+    cores = {}
     for title, actual in rows:
-        if actual == 0:
-            continue
         core = title.split(" (")[0].split(".epub")[0].strip()
-        if len(core) < 3:
+        if len(core) >= 3 and core.lower() not in cores:
+            cores[core.lower()] = (core, actual)
+    if not cores:
+        return []
+    ordered = sorted(cores.values(), key=lambda t: -len(t[0]))
+    pattern = re.compile(
+        r"\b(?:" + "|".join(re.escape(c) for c, _ in ordered) + r")\b",
+        re.I,
+    )
+    out = []
+    for m in pattern.finditer(answer):
+        core, actual = cores.get(m.group(0).lower(), (None, None))
+        if core is None or actual == 0:
             continue
-        for m in re.finditer(r"\b" + re.escape(core) + r"\b", answer):
-            seg = answer[max(0, m.start() - 40): m.start() + 220]
-            seg = re.split(r"\bChapter\b", seg, maxsplit=1)[0]
-            seg = seg.split("\n")[0]
-            # "Dune" is a substring of "Dune Messiah"/"Children of Dune" —
-            # if another census title appears inside this segment the claim
-            # is ambiguous ("...Dune Messiah ... have 0 occurrences" is about
-            # Messiah, not Dune) and must not be flagged.
-            if any(
-                c != core and re.search(r"\b" + re.escape(c) + r"\b", seg)
-                for c in all_cores
-            ):
-                continue
-            nums = [int(n) for n in re.findall(r"\b(\d+)\b", seg)]
-            if nums and all(n != actual for n in nums):
-                out.append(
-                    f"{core}: answer says {nums[0]}, census counts {actual}"
-                )
+        claimed = _census_claim_after(answer[m.end(): m.end() + 60])
+        if claimed is not None and claimed != actual:
+            out.append(f"{core}: answer says {claimed}, census counts {actual}")
+            if len(out) >= 4:
                 break
     # grand-total claims without book names ("I count 12 across the six novels")
     grand = sum(n for _, n in rows)
     if grand > 0:
         for m in re.finditer(
-            r"(?:i\s+count(?:ed)?\s+(\d+))"
-            r"|(?:there\s+are\s+(\d+)\s+(?:of|occurrences?|mentions?|times?))"
-            r"|(?:\b(\d+)\s+(?:occurrences?|times?|mentions?|instances?)\s*"
+            r"(?:i\s+count(?:ed)?\s+(\d[\d,]*))"
+            r"|(?:there\s+are\s+(\d[\d,]*)\s+(?:of|occurrences?|mentions?|times?))"
+            r"|(?:\b(\d[\d,]*)\s+(?:occurrences?|times?|mentions?|instances?)\s*"
             r"(?:in\s+|across\s+|among\s+)(?:the\s+)?(?:six|entire|whole|all|total))"
-            r"|(?:appears?\s+(\d+)\s+times)",
+            r"|(?:appears?\s+(\d[\d,]*)\s+times)",
             answer,
             re.I,
         ):
-            claimed = next((int(g) for g in m.groups() if g), None)
+            claimed = next(
+                (int(g.replace(",", "")) for g in m.groups() if g), None
+            )
             if claimed is not None and claimed != grand:
                 out.append(
                     f"overall count: answer says {claimed}, census counts {grand}"
@@ -5949,7 +6148,7 @@ def _hunt_passages_uncached(question, limit=36):
     phrases, terms = _hunt_phrases(question)
     if not phrases and not terms:
         return []
-    by_id = {c["chunk_id"]: c for c in _load_chunk_texts()}
+    by_id = _chunks_by_id()
     if not by_id:
         return []
     scores = {}
@@ -6289,7 +6488,9 @@ def _render_passage_block(passages, full=False, max_chars=None):
     lines = []
     budget = max_chars
     omitted = 0
-    for i, p in enumerate(passages, 1):
+    seen_text = set()  # dedupe overlapping chunks that render identical text
+    shown = 0
+    for p in passages:
         raw_fp = str(p.get("file_path", ""))
         fp = _clean_name(raw_fp)
         marker = raw_fp.split(" · ", 1)[1] if " · " in raw_fp else ""
@@ -6306,11 +6507,20 @@ def _render_passage_block(passages, full=False, max_chars=None):
             text = str(p.get("content") or p.get("excerpt", ""))[:2400]
         else:
             text = str(p.get("excerpt") or p.get("content", ""))[:_PASSAGE_EXCERPT_CHARS]
+        # Context compression: the same passage can arrive from several angles
+        # (semantic + scoped sweeps). Emitting it once saves prompt tokens and
+        # cannot lose evidence.
+        sig = re.sub(r"\s+", " ", text).strip().lower()[:400]
+        if sig and sig in seen_text:
+            omitted += 1
+            continue
+        seen_text.add(sig)
         text = _escape_format(text)
         # prefix each line with '>' so verse/poetry keeps its line breaks
         text = "\n".join(("> " + ln) if ln.strip() else ">" for ln in text.split("\n"))
-        entry = f"[{i}] {fp}{tag}\n{text}"
-        if len(entry) > budget and omitted == 0 and i == 1:
+        shown += 1
+        entry = f"[{shown}] {fp}{tag}\n{text}"
+        if len(entry) > budget and omitted == 0 and shown == 1:
             # a single giant first passage still must not blow the window
             entry = entry[: max(1200, budget)]
         if len(entry) > budget:
@@ -6318,8 +6528,8 @@ def _render_passage_block(passages, full=False, max_chars=None):
             continue
         lines.append(entry)
         budget -= len(entry) + 2
-        if budget < 1200 and i < len(passages):
-            omitted += len(passages) - i
+        if budget < 1200 and shown < len(passages):
+            omitted += len(passages) - shown
             break
     if omitted:
         lines.append(f"> … {omitted} further passage(s) omitted to respect the context budget.")
@@ -7337,6 +7547,39 @@ def _get_reranker():
     return _RERANKER
 
 
+def warm_models():
+    """Load the local reranker and the index caches up front, so the *first*
+    question doesn't pay the model-load / cold-index cost. Best-effort: any
+    failure is swallowed (a cold first question still works, just slower).
+
+    Run from a daemon thread at engine start (see server.py); never blocks boot.
+    """
+    if os.getenv("MENTAT_WARM_MODELS", "1") == "0":
+        return
+    try:
+        _get_reranker().predict([["warm up", "the litany against fear"]])
+    except Exception:
+        pass
+    try:
+        _load_chunk_texts()
+        _chunks_by_id()
+        _low_file_paths()
+        _book_map()
+    except Exception:
+        pass
+    # The vocabulary scan and span index are the biggest first-question costs
+    # (a full staged-file read / paragraph split). Pay them at boot so the first
+    # probe is as fast as the rest.
+    try:
+        _library_vocab()
+    except Exception:
+        pass
+    try:
+        _build_spans()
+    except Exception:
+        pass
+
+
 async def _rerank_model(query, documents, top_n=8, **kwargs):
     """Signature LightRAG expects -> [{'index': i, 'relevance_score': s}]."""
     try:
@@ -7480,6 +7723,134 @@ def _citation_for(passage):
         if anchors:
             return " · ".join([book] + anchors)
     return f"{book} · {marker}" if marker else book
+
+
+_PASSAGE_CACHE = {}
+# The evidence passages behind the most recent answer, so a citation tap can be
+# resolved back to the exact chunk that produced it (labels alone are too coarse
+# — a chapter holds many chunks). Internal only; never leaves the process.
+_LAST_ANSWER_PASSAGES = []
+
+
+def _hint_overlap(content, hint):
+    """Fraction of `content`'s words echoed by `hint` — high when the answer
+    quotes the passage, which is exactly how we pick among same-label chunks."""
+    if not content or not hint:
+        return 0.0
+    cw = set(re.findall(r"[a-z0-9]+", str(content).lower()))
+    if not cw:
+        return 0.0
+    hw = set(re.findall(r"[a-z0-9]+", str(hint).lower()))
+    return len(cw & hw) / len(cw)
+
+
+
+def _citation_parts(passage):
+    """`(book, loc)` split of `_citation_for`, matching the stream's format."""
+    label = _citation_for(passage)
+    if not label:
+        return "", ""
+    book, _, loc = label.partition(" · ")
+    return book.strip(), loc.strip()
+
+
+def _citation_index():
+    """`(book, loc) -> [chunks]`, cached and dropped with the chunk store."""
+    global _CITATION_INDEX
+    if _CITATION_INDEX is None:
+        idx = {}
+        for c in _chunks_by_id().values():
+            b, l = _citation_parts(c)
+            if b:
+                idx.setdefault((b.lower(), l.lower()), []).append(c)
+        _CITATION_INDEX = idx
+    return _CITATION_INDEX
+
+
+def _sentence_around(text, needle, span=520):
+    """A self-contained quote window around `needle` (or the head of `text`)."""
+    text = re.sub(r"[ \t]+", " ", str(text or "")).strip()
+    if not text:
+        return ""
+    idx = text.lower().find(str(needle or "").lower()) if needle else -1
+    if idx < 0:
+        return text[:span].strip()
+    start = max(0, idx - span // 3)
+    end = min(len(text), start + span)
+    snippet = text[start:end].strip()
+    if start > 0:
+        cut = snippet.find(". ")
+        if 0 <= cut < 140:
+            snippet = snippet[cut + 2 :].strip()
+    return snippet
+
+
+def _passage_source(book, loc, hint=""):
+    """Resolve a `(Book · loc)` citation back to its verbatim source window.
+
+    The stream only carries the human citation label, so this matches the chunk
+    store's own `_citation_for` output; duplicates are disambiguated by term
+    overlap with the answer/question `hint`. Read-only — the app uses it to open
+    the reader at the passage a citation came from.
+    """
+    book = str(book or "").strip()
+    loc = str(loc or "").strip()
+    if not book:
+        return None
+    cache_key = (book.lower(), loc.lower(), str(hint or "")[:160].lower())
+    hit = _PASSAGE_CACHE.get(cache_key)
+    if hit is not None:
+        return hit
+
+    nb, nl = book.lower(), loc.lower()
+    index = _citation_index()
+    candidates = []
+
+    # Prefer the exact passages that grounded the last answer: they are the
+    # real source, so same-chapter ambiguity is resolved by quote overlap.
+    for p in _LAST_ANSWER_PASSAGES:
+        b, l = _citation_parts(p)
+        if not b:
+            continue
+        cb, cl = b.lower(), l.lower()
+        if cb == nb and (cl == nl or (nl and (nl in cl or cl in nl))):
+            candidates.append(p)
+
+    if not candidates:
+        candidates = list(index.get((nb, nl), []))
+        if not candidates:
+            # lenient: same book, loc is a prefix/containment (anchor drift)
+            for (b, l), chunks in index.items():
+                if b == nb and nl and (nl in l or l in nl):
+                    candidates.extend(chunks)
+    if not candidates:
+        return None
+
+    terms = [t for t in _derive_terms(hint, cap=12) if len(t) >= 3] if hint else []
+
+    def _score(c):
+        content = c.get("content") or c.get("excerpt") or ""
+        over = _hint_overlap(content, hint)
+        if terms:
+            low = str(content).lower()
+            over += 0.001 * sum(1 for t in terms if t in low)
+        return over
+
+    best = max(candidates, key=_score)
+
+    quote = _sentence_around(
+        best.get("content") or best.get("excerpt"), terms[0] if terms else "", 520
+    )
+    out = {
+        "book": book,
+        "loc": loc,
+        "quote": quote,
+        "text": _long_citation_window(best, width=5000),
+    }
+    if len(_PASSAGE_CACHE) > 64:
+        _PASSAGE_CACHE.clear()
+    _PASSAGE_CACHE[cache_key] = out
+    return out
 
 
 _QUOTE_RE = re.compile(
@@ -9289,6 +9660,13 @@ class Brain:
                 "question": question,
                 "message": STORAGE_STALE_MSG,
             }
+        if _is_greeting(question):
+            return {
+                "status": "answered",
+                "question": question,
+                "answer": _greeting_reply(question),
+                "contexts": [],
+            }
         settings = _load_settings()
         mode = mode or settings["mode"]
         _t0ask = time.time()
@@ -9659,6 +10037,25 @@ class Brain:
         """
         if not _store_ok():
             raise RuntimeError(STORAGE_STALE_MSG)
+        if _is_greeting(question):
+            text = _greeting_reply(question)
+            self._last_stream_result = {
+                "answer": text,
+                "refs": [],
+                "entry": {"question": question, "answer": text, "model": "mentat"},
+                "reasoning": "",
+                "served_local": False,
+                "served_model": "mentat",
+                "t_thinking": 0.0,
+                "t_content": 0.0,
+                "tokens_in": 0,
+                "tokens_out": 0,
+                "cost_usd": 0.0,
+                "route_reason": "greeting",
+                "kind": "chat",
+            }
+            yield text
+            return
         self._last_stream_result = None
         _t0 = time.time()
         self._trace = []
@@ -9817,6 +10214,8 @@ class Brain:
                 _question_kind(question)
             )
         _t("context")
+        global _LAST_ANSWER_PASSAGES
+        _LAST_ANSWER_PASSAGES = list(passages or [])
         refs = [
             {"file_path": p.get("file_path"), "reference_id": str(i + 1)}
             for i, p in enumerate(passages or [])
@@ -10085,6 +10484,12 @@ class Brain:
                 "t_content": round(t_content, 1) if t_content else 0.0,
                 "tokens_in": _tok_in,
                 "tokens_out": _tok_out,
+                "cache_hit_tokens": int(
+                    (usage_snapshot or {}).get("cache_hit_tokens", 0) or 0
+                ),
+                "cache_miss_tokens": int(
+                    (usage_snapshot or {}).get("cache_miss_tokens", 0) or 0
+                ),
                 "cost_usd": estimate_cost(
                     served_model or used_model, _tok_in, _tok_out
                 ),
@@ -10365,7 +10770,17 @@ class Brain:
         if not matches:
             return {"status": "not_found", "message": f"no indexed work matches {work!r}"}
         book_key = matches[0]
-        rels = [rel for rel in _load_manifest() if _title_canon(rel) == book_key]
+        # The matching key is a normalized chunk identity
+        # ("chapterhousedune(frankherbert).epub"); manifest paths canonicalize
+        # to a display id ("chapterhouse dune"). Collapse the key to that id
+        # first, or the comparison can never succeed and every work looks
+        # "not in the manifest".
+        try:
+            _works = _collapse_works([book_key])
+            work_id = _works[0]["id"] if _works else _title_canon(book_key)
+        except Exception:
+            work_id = _title_canon(book_key)
+        rels = [rel for rel in _load_manifest() if _title_canon(rel) == work_id]
         rels.sort(key=lambda r: (".epub" not in r, len(r)))
         if not rels:
             return {"status": "not_found", "message": f"{work!r} is not in the manifest"}
