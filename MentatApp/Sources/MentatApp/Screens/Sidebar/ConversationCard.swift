@@ -103,7 +103,7 @@ struct ConversationCard: View {
     private var header: some View {
         HStack(spacing: 6) {
             Image(systemName: "bubble.left.and.bubble.right")
-                .font(.system(size: 10, weight: .semibold))
+                .font(.system(size: TypeScale.caption, weight: .semibold))
                 .foregroundStyle(selected ? accent : dim)
             if pinned {
                 Image(systemName: "pin.fill")

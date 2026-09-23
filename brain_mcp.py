@@ -20,7 +20,6 @@ async def _get_brain():
     global _brain
     if _brain is None:
         _brain = Brain()
-        await _brain.open()
     return _brain
 
 
@@ -52,21 +51,18 @@ async def index_knowledge(only: str = "") -> str:
         "relationships, supporting passages)."
     ),
 )
-async def ask_brain(question: str, mode: str = "") -> str:
-    if mode not in ("naive", "local", "global", "hybrid", "mix"):
-        mode = ""
+async def ask_brain(question: str) -> str:
     brain = await _get_brain()
     async with _brain_lock:
-        result = await brain.ask(question, mode=mode or None)
+        result = await brain.ask(question)
     # Every non-answered outcome (needs_index, indexing_running, store_stale,
-    # greeting, …) has a different shape and some have no answer/contexts/mode.
+    # greeting, …) has a different shape and some have no answer/contexts.
     # Pass those through untouched instead of KeyError-ing on the missing keys.
     if str(result.get("status") or "") != "answered":
         return json.dumps(result, indent=2, ensure_ascii=False)
     payload = {
         "status": "answered",
         "question": result.get("question", question),
-        "mode": result.get("mode") or mode or "",
         "draft_answer": result.get("answer") or "",
         "evidence": result.get("contexts") or [],
     }

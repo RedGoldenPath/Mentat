@@ -13,11 +13,8 @@ struct PaletteHost<Content: View>: View {
     var body: some View {
         content
             .environment(\.palette,
-                         Palette.forTheme(theme, colorTheme: engine.colorTheme,
-                                          active: engine.useOKLCHTheme))
+                         Palette.forTheme(theme, colorTheme: engine.colorTheme))
             .environment(\.appTheme, theme)
-            // the global artwork palette — the authority for UI + text colour
-            .environment(\.bgPalette, engine.bgPalette)
             // the OKLCH color system — the contrast-enforced authority
             .environment(\.colorTheme, engine.colorTheme)
             .environment(\.glassStyle, engine.glassStyle)

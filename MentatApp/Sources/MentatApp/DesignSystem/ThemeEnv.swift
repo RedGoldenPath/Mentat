@@ -75,9 +75,10 @@ struct Palette {
 
     /// When the OKLCH theme is active, derive the whole palette from it, so every
     /// static `pal.*` usage (headers, chips, labels, sheens, statuses) follows
-    /// the image hue. Falls back to the classic desert palette otherwise.
-    static func forTheme(_ t: AppTheme, colorTheme: ColorTheme, active: Bool) -> Palette {
-        guard active, colorTheme != .placeholder else { return forTheme(t) }
+    /// the image hue. Falls back to the classic desert palette before the first
+    /// theme resolves.
+    static func forTheme(_ t: AppTheme, colorTheme: ColorTheme) -> Palette {
+        guard colorTheme != .placeholder else { return forTheme(t) }
         let ct = colorTheme
         return Palette(
             isDark: !ct.isLight,
@@ -155,16 +156,6 @@ extension EnvironmentValues {
     var ink: AppInk {
         get { self[AppInkKey.self] }
         set { self[AppInkKey.self] = newValue }
-    }
-}
-
-/// The global artwork palette, provided once at the root. Every UI colour can be
-/// resolved through this (`@Environment(\.bgPalette)`) instead of hard-coding.
-private struct BgPaletteKey: EnvironmentKey { static let defaultValue = BackgroundPalette.placeholder }
-extension EnvironmentValues {
-    var bgPalette: BackgroundPalette {
-        get { self[BgPaletteKey.self] }
-        set { self[BgPaletteKey.self] = newValue }
     }
 }
 

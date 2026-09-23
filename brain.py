@@ -424,7 +424,7 @@ async def cmd_ask(args):
     try:
         if getattr(args, "trace", False):
             acc = ""
-            async for text in brain.ask_stream(args.question, mode=args.mode):
+            async for text in brain.ask_stream(args.question):
                 acc = text
             res = brain._last_stream_result or {}
             answer = res.get("answer") or acc or "…(no answer)"
@@ -435,7 +435,7 @@ async def cmd_ask(args):
                 console.print(f"  [dim]{name:>16}[/]  +{t - prev:>6.2f}s   (t={t:.1f}s)")
                 prev = t
             return
-        result = await brain.ask(args.question, mode=args.mode, lazy=not args.no_lazy)
+        result = await brain.ask(args.question, lazy=not args.no_lazy)
         if result.get("status") == "indexing_running":
             console.print(f"[yellow]{result['message']}[/yellow]")
         elif result.get("status") == "needs_index":
@@ -451,7 +451,7 @@ async def cmd_ask(args):
                         console.print(f"[yellow]{stats['message']}[/yellow]")
                     else:
                         print(json.dumps(stats, indent=2))
-                        result = await brain.ask(args.question, mode=args.mode, lazy=False)
+                        result = await brain.ask(args.question, lazy=False)
         if result.get("status") == "answered":
             _print_answer(result)
     finally:
@@ -529,7 +529,7 @@ async def cmd_history(args):
         print("No conversation history yet.")
         return
     for index, entry in enumerate(entries, start=1):
-        print(f"--- {index} [{entry['timestamp']}] ({entry['mode']}) ---")
+        print(f"--- {index} [{entry['timestamp']}] ---")
         print(f"Q: {entry['question']}")
         answer = entry["answer"]
         print(f"A: {answer[:2000]}")
@@ -912,7 +912,6 @@ async def cmd_console(args):
     chips = "   ".join(
         [
             _chip("lens", "active" if lens else "none", "yellow" if lens else "dim"),
-            _chip("style", settings["mode"], "magenta"),
             _chip("thinking", settings["thinking"], "bright_blue"),
             _chip("model", model_label(settings.get("model") or ""), "magenta" if settings.get("model") not in (None, "", "qwen") else "bright_cyan"),
             _chip("docs", idx["docs_indexed"], "green"),
@@ -959,7 +958,7 @@ async def cmd_console(args):
                         info,
                         ["documents", "entities", "relationships", "chunks", "pending_files",
                          "extract_model", "query_model", "embed_model", "thinking",
-                         "history_turns", "mode", "temperature", "lens_active"],
+                         "history_turns", "temperature", "lens_active"],
                     )
                 )
                 continue
@@ -968,7 +967,7 @@ async def cmd_console(args):
                     _kv_table(
                         "settings",
                         brain.get_settings(),
-                        ["thinking", "history_turns", "mode", "model", "temperature", "top_k", "chunk_top_k", "sweep_depth", "lens"],
+                        ["thinking", "history_turns", "model", "temperature", "top_k", "chunk_top_k", "sweep_depth", "lens"],
                     )
                 )
                 continue
@@ -1011,7 +1010,7 @@ async def cmd_console(args):
                 continue
             console.print(f"[cyan]you:[/cyan] {question}")
             console.print("[dim]thinking...[/dim]", end="")
-            result = await brain.ask(question, mode=args.mode, lazy=not args.no_lazy)
+            result = await brain.ask(question, lazy=not args.no_lazy)
             if result.get("status") == "indexing_running":
                 console.print()
                 console.print(f"[yellow]{result['message']}[/yellow]")
@@ -1025,13 +1024,13 @@ async def cmd_console(args):
                         console.print(f"[yellow]{stats['message']}[/yellow]")
                     else:
                         console.print(f"[green]{stats}[/green]")
-                        result = await brain.ask(question, mode=args.mode, lazy=False)
+                        result = await brain.ask(question, lazy=False)
             if result.get("status") == "answered":
                 console.print()
                 console.print(
                     Panel(
                         _md(result["answer"]),
-                        title=f"answer · {result['timestamp']} · {result['mode']}",
+                        title=f"answer · {result['timestamp']}",
                         title_align="left",
                         border_style="green",
                     )
@@ -1110,7 +1109,6 @@ def main():
 
     ask = subparsers.add_parser("ask", help="ask a question with graph-based reasoning")
     ask.add_argument("question", nargs="+")
-    ask.add_argument("--mode", default=None, choices=["naive", "local", "global", "hybrid", "mix"])
     ask.add_argument("--no-lazy", action="store_true", help="never auto-index before answering")
     ask.add_argument("--trace", action="store_true", help="print per-phase timing after the answer")
 
@@ -1119,7 +1117,6 @@ def main():
 
     find = subparsers.add_parser("find", help="hunt a half-remembered quote across all books")
     find.add_argument("question", nargs="+")
-    find.add_argument("--mode", default=None, choices=["naive", "local", "global", "hybrid", "mix"])
     find.add_argument("--no-lazy", action="store_true", help="never auto-index before answering")
     find.add_argument("--trace", action="store_true", help="print per-phase timing after the answer")
 
@@ -1194,7 +1191,6 @@ def main():
     reset.add_argument("--yes", action="store_true")
 
     console = subparsers.add_parser("console", help="interactive console")
-    console.add_argument("--mode", default=None, choices=["naive", "local", "global", "hybrid", "mix"])
     console.add_argument("--no-lazy", action="store_true")
 
     subparsers.add_parser("stats", help="show the research diary (telemetry) summaries")

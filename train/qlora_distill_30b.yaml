@@ -1,0 +1,26 @@
+# Prana Bindu — distill into the Qwen3-30B-A3B-Instruct MoE (~3B active).
+# Fast like a small model, smart like a big one; distillation teaches it the
+# 27B writer's grounded, cited behaviour. Data: train/data_distill.
+
+model: models/Qwen3-30B-A3B-Instruct-2507-4bit
+train: true
+data: data_distill
+seed: 42
+fine_tune_type: lora
+num_layers: 16
+batch_size: 1
+iters: 150
+val_batches: 4
+learning_rate: 5.0e-6
+steps_per_report: 20
+steps_per_eval: 50
+save_every: 50
+clear_cache_threshold: 4
+adapter_path: adapters/mentat-distill-30b
+max_seq_length: 2048
+mask_prompt: true
+grad_checkpoint: true
+lora_parameters:
+  rank: 16
+  dropout: 0.05
+  scale: 16.0

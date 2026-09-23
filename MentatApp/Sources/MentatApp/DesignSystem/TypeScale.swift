@@ -3,6 +3,8 @@ import CoreGraphics
 /// Semantic type scale, read live from `DesignTokens.typography`, so font sizes
 /// are data (editable via the Design panel) instead of scattered literals.
 enum TypeScale {
+    static var display: CGFloat { CGFloat(DesignTokens.current.typography.display) }
+    static var title: CGFloat { CGFloat(DesignTokens.current.typography.title) }
     static var micro: CGFloat { CGFloat(DesignTokens.current.typography.micro) }
     static var meta: CGFloat { CGFloat(DesignTokens.current.typography.meta) }
     static var caption: CGFloat { CGFloat(DesignTokens.current.typography.caption) }

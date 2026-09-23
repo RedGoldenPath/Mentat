@@ -1,0 +1,34 @@
+# Prana Bindu — distill the 27B writer's grounded answers into a small model.
+# Data: train/data_distill (built by train/build_distill.py; LOCAL 27B teacher,
+# verifier-filtered). Target: a small instruct model that can answer routine
+# questions like the big one — the real offline speed/RAM win.
+#
+# Prereqs: an MLX 4-bit small model, e.g.
+#   train/.venv/bin/python -m mlx_lm.convert --hf-path Qwen/Qwen2.5-7B-Instruct \
+#       -q --q-bits 4 --mlx-path train/models/Qwen2.5-7B-Instruct-4bit
+# Then:
+#   cd train && .venv/bin/python run_lora.py -c qlora_distill.yaml
+# Gate the adapter with eval_adapter_mlx.py + the battery/gold/quote-verbatim
+# metrics before adopting it anywhere.
+model: models/Qwen2.5-7B-Instruct-4bit
+train: true
+data: data_distill
+seed: 42
+fine_tune_type: lora
+num_layers: 16
+batch_size: 2
+iters: 150
+val_batches: 4
+learning_rate: 5.0e-6
+steps_per_report: 20
+steps_per_eval: 50
+save_every: 50
+clear_cache_threshold: 8
+adapter_path: adapters/mentat-distill
+max_seq_length: 2048
+mask_prompt: true
+grad_checkpoint: true
+lora_parameters:
+  rank: 16
+  dropout: 0.05
+  scale: 16.0

@@ -238,7 +238,7 @@ struct PagedText: View {
                 flip(idx - 1, pages)
             } label: {
                 Image(systemName: "chevron.left")
-                    .font(.system(size: 10, weight: .bold))
+                    .font(.system(size: TypeScale.caption, weight: .bold))
                     .padding(5).contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -265,7 +265,7 @@ struct PagedText: View {
                 flip(idx + 1, pages)
             } label: {
                 Image(systemName: "chevron.right")
-                    .font(.system(size: 10, weight: .bold))
+                    .font(.system(size: TypeScale.caption, weight: .bold))
                     .padding(5).contentShape(Rectangle())
             }
             .buttonStyle(.plain)

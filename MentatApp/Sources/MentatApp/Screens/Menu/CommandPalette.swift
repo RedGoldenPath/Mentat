@@ -6,7 +6,10 @@ struct CommandPalette: View {
     var debugMode: Bool = false
     let onPick: (String) -> Void
     @State private var query = ""
+    @State private var hovered: CommandItem.ID?
     @Environment(\.palette) private var pal
+
+    private var accent: Color { Engine.shared.accentColor(.center) }
 
     private var items: [CommandItem] {
         CommandItem.all(debug: debugMode)
@@ -48,19 +51,29 @@ struct CommandPalette: View {
     }
 
     private func row(_ item: CommandItem) -> some View {
-        Button {
+        let hot = hovered == item.id
+        return Button {
             onPick(item.cmd)
         } label: {
             HStack {
-                Text("/\(item.cmd)").foregroundStyle(
-                    Engine.shared.accentColor(.center)
-                ).frame(width: 110, alignment: .leading)
+                Text("/\(item.cmd)").foregroundStyle(accent).frame(width: 110, alignment: .leading)
                 Text(item.help).foregroundStyle(pal.text)
                 Spacer()
             }
-            .padding(.horizontal, 14).padding(.vertical, 7)
-            .contentShape(Rectangle())
+            .font(.system(size: TypeScale.body))
+            .padding(.horizontal, 12).padding(.vertical, 8)
+            .background {
+                if hot {
+                    Color.clear
+                        .glassEffect(
+                            Glass.regular.tint(accent.opacity(0.55)),
+                            in: Capsule(style: .continuous))
+                }
+            }
+            .contentShape(Capsule())
+            .padding(.horizontal, 8)
         }
         .buttonStyle(.plain)
+        .onHover { hovered = $0 ? item.id : (hovered == item.id ? nil : hovered) }
     }
 }

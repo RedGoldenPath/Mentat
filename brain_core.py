@@ -8,6 +8,7 @@ import logging
 import os
 import random
 import re
+import resource
 import shutil
 import sqlite3
 import sys
@@ -84,7 +85,14 @@ os.environ.setdefault("CHUNK_F_OVERLAP_SIZE", "200")
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
 OLLAMA_LLM_MODEL = os.getenv("OLLAMA_LLM_MODEL", "qwen3.8:27b")
-OLLAMA_DEEP_MODEL = os.getenv("OLLAMA_DEEP_MODEL", "qwen3:30b-a3b")
+OLLAMA_DEEP_MODEL = os.getenv("OLLAMA_DEEP_MODEL", "qwen3.8:27b")
+# The offline helper (planner / classifier / map builder). A small non-thinking
+# instruct model is plenty for those meta tasks and keeps the big writer out of
+# the picture for planning (qwen3:4b leaks reasoning; qwen2.5:7b returns clean JSON).
+OLLAMA_FAST_MODEL = os.getenv("OLLAMA_FAST_MODEL", "qwen2.5:7b")
+# Unload the helper quickly — it is only needed for planning/classification, so
+# it should not hold RAM for 30 minutes like the writer does.
+OLLAMA_FAST_KEEP_ALIVE = os.getenv("OLLAMA_FAST_KEEP_ALIVE", "2m")
 OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 EMBED_DIM = int(os.getenv("EMBED_DIM", "768"))
 
@@ -101,8 +109,7 @@ SKIP_SUFFIXES = {".ds_store", ".ini", ".cfg", ".json", ".db", ".sqlite", ".sqlit
 SETTINGS_DEFAULTS = {
     "thinking": "false",
     "history_turns": 6,
-    "mode": "naive",
-    "model": "deepseek-flash",
+    "model": "qwen",
     "temperature": None,
     "top_k": 40,
     "chunk_top_k": 6,
@@ -137,7 +144,6 @@ SETTINGS_SPEC = [
     {"key": "model", "section": "Answering", "help": "which engine writes the answers"},
     {"key": "thinking", "section": "Answering", "help": "reasoning depth (local qwen + routing)"},
     {"key": "voice", "section": "Answering", "help": "writing voice preset"},
-    {"key": "mode", "section": "Answering", "help": "legacy label from the old RAG modes — does NOT affect answers"},
     {"key": "routing", "section": "Answering", "help": "heuristic/hybrid model routing"},
     {"key": "routing_threshold", "section": "Answering", "help": "score cutoff for routing to the deep model"},
     {"key": "offline", "section": "Answering", "help": "true = local qwen only, no API"},
@@ -167,7 +173,6 @@ SETTINGS_SPEC = [
     {"key": "auto_reload", "section": "Display", "help": "restart the app when code changes"},
 ]
 
-VALID_MODES = ("naive", "local", "global", "hybrid", "mix")
 VALID_THINKING = ("false", "true", "low", "medium", "high")
 VALID_ROUTING = ("off", "heuristic", "hybrid")
 
@@ -531,9 +536,7 @@ def _offline_gen_kwargs(question):
     if _has_quote_intent(q) or any(
         w in q for w in ("find", "list", "give me", "quotes", "quote")
     ):
-        cap = 700
-    elif len(str(question).split()) <= 7:
-        cap = 300
+        cap = 4000  # enumerate fully: quote/instance lists need room
     elif any(
         w in q
         for w in (
@@ -542,11 +545,30 @@ def _offline_gen_kwargs(question):
             "connect", "nature of", "say about",
         )
     ) or _has_universal_intent(q):
-        cap = 1500
+        cap = 3000
+    elif len(str(question).split()) <= 7:
+        cap = 500
     else:
-        cap = 900
+        cap = 1500
+    # Fast-path questions are simple lookups: fewer generated tokens = less
+    # sustained load. (The fast path also trims the evidence block.)
+    try:
+        if _answer_path(
+            question, _retrieval_strategy(question, _question_heuristic_score(question)), kind
+        ) == "fast":
+            cap = min(cap, 600)
+    except Exception:
+        pass
     kwargs["max_tokens"] = cap
     return kwargs
+
+
+def _looks_truncated(ans):
+    """True when an answer stops without terminal punctuation (cap clipped it)."""
+    s = str(ans or "").rstrip()
+    if not s:
+        return False
+    return s[-1] not in ".!?\"”’)]}…"
 CONCEPT_INSTRUCTION = (
     "The passages provided above ARE your source material — quote them "
     "verbatim when you quote. Interpret the user's words as concepts, not "
@@ -637,7 +659,7 @@ BASE_RESPONSE_TEMPLATE = (
 )
 
 
-def _rag_system_prompt(mode, interpretive=False):
+def _rag_system_prompt(interpretive=False):
     """System prompt for the answer call.
 
     ``interpretive`` swaps the strict grounding template for the
@@ -685,7 +707,7 @@ def _short_summary(question):
 def _group_sources_by_book(refs):
     """Group chunk references by their book, one line per book.
 
-    Each LightRAG reference is a chapter-level file_path like
+    Each reference is a chapter-level file_path like
     ``"Book Title.epub · Chapter 3 (ch5)"``; a single passage can be grounded
     in many chapters of the same book, so the sources panel would otherwise
     list one source per chapter. This strips the ``· marker`` segment and
@@ -985,7 +1007,7 @@ def resolve_provider(model_id):
 
     Prefix conventions: "openrouter/…" and "moonshot/…"/"kimi/…" route through
     those endpoints; unprefixed deepseek-* uses the direct DeepSeek API;
-    anything else is treated as a local model with no provider.
+    anything else is treated as a local Ollama model with no provider.
     """
     key = str(model_id or "").strip()
     if not key:
@@ -1319,11 +1341,6 @@ def _coerce_setting(key, value):
         if n < 0:
             raise ValueError("history_turns must be >= 0")
         return n
-    if key == "mode":
-        v = str(value).strip()
-        if v not in VALID_MODES:
-            raise ValueError(f"mode must be one of: {', '.join(VALID_MODES)}")
-        return v
     if key == "model":
         return str(value).strip()
     if key == "temperature":
@@ -1685,7 +1702,7 @@ async def remote_llm(
     if kwargs.get("stream"):
 
         async def gen():
-            client = AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=limit)
+            client = _cached_openai_client(base_url, api_key, limit)
             stream = None
             try:
                 stream = await client.chat.completions.create(**params, stream=True)
@@ -1727,30 +1744,26 @@ async def remote_llm(
                         await stream.close()
                     except Exception:
                         pass
-                await client.close()
 
         return gen()
 
-    client = AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=limit)
+    client = _cached_openai_client(base_url, api_key, limit)
+    response = await client.chat.completions.create(**params)
     try:
-        response = await client.chat.completions.create(**params)
-        try:
-            usage = response.usage
-            _LAST_USAGE = {
-                "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
-                "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
-                "cache_hit_tokens": int(getattr(usage, "prompt_cache_hit_tokens", 0) or 0),
-                "cache_miss_tokens": int(getattr(usage, "prompt_cache_miss_tokens", 0) or 0),
-            }
-        except Exception:
-            _LAST_USAGE = {}
-        message = response.choices[0].message
-        rc = getattr(message, "reasoning_content", None)
-        if rc:
-            _LAST_REASONING += str(rc)
-        return message.content
-    finally:
-        await client.close()
+        usage = response.usage
+        _LAST_USAGE = {
+            "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+            "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+            "cache_hit_tokens": int(getattr(usage, "prompt_cache_hit_tokens", 0) or 0),
+            "cache_miss_tokens": int(getattr(usage, "prompt_cache_miss_tokens", 0) or 0),
+        }
+    except Exception:
+        _LAST_USAGE = {}
+    message = response.choices[0].message
+    rc = getattr(message, "reasoning_content", None)
+    if rc:
+        _LAST_REASONING += str(rc)
+    return message.content
 
 
 async def deepseek_llm(prompt, system_prompt=None, history_messages=None, model=None, timeout=None, **kwargs):
@@ -1800,8 +1813,8 @@ async def moonshot_llm(
     )
 
 
-def _ollama_request(messages, model, stream, options, think=False):
-    """Direct Ollama /api/chat call (no LightRAG). Returns the http response."""
+def _ollama_request(messages, model, stream, options, think=False, keep_alive=None):
+    """Direct Ollama /api/chat call. Returns the http response."""
     import urllib.request
 
     payload = json.dumps(
@@ -1810,7 +1823,7 @@ def _ollama_request(messages, model, stream, options, think=False):
             "messages": messages,
             "stream": stream,
             "options": options or {},
-            "keep_alive": OLLAMA_KEEP_ALIVE,
+            "keep_alive": keep_alive or OLLAMA_KEEP_ALIVE,
             "think": bool(think),
         }
     ).encode("utf-8")
@@ -1858,12 +1871,20 @@ async def ollama_llm(prompt, system_prompt=None, history_messages=None, local_mo
     if think is None:
         think = settings.get("thinking") in ("high", "true", "medium")
     stream = bool(kwargs.get("stream"))
+    keep_alive = kwargs.get("keep_alive")
 
     if not stream:
         try:
-            resp = await asyncio.to_thread(_ollama_request, messages, model, False, options, think)
+            resp = await asyncio.to_thread(
+                _ollama_request, messages, model, False, options, think, keep_alive
+            )
             with resp:
                 out = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            global _LAST_USAGE
+            _LAST_USAGE = {
+                "prompt_tokens": int(out.get("prompt_eval_count", 0) or 0),
+                "completion_tokens": int(out.get("eval_count", 0) or 0),
+            }
             return (out.get("message") or {}).get("content") or ""
         except Exception:
             raise
@@ -1876,7 +1897,7 @@ async def ollama_llm(prompt, system_prompt=None, history_messages=None, local_mo
 
         def producer():
             try:
-                resp = _ollama_request(messages, model, True, options, think)
+                resp = _ollama_request(messages, model, True, options, think, keep_alive)
                 with resp:
                     for raw in resp:
                         q.put(raw.decode("utf-8", errors="ignore"))
@@ -2114,6 +2135,11 @@ async def _route_model(question, force_deep=False):
             _ROUTE_REASON = f"pinned synth_model={synth}"
             return synth
     if _offline():
+        sel = str(settings.get("model") or "").strip()
+        resolved = resolve_model(sel) if sel else ""
+        if resolved and "qwen" in resolved.lower():
+            _ROUTE_REASON = f"offline → {sel}"
+            return sel
         _ROUTE_REASON = "offline → local qwen3.8 (Gom Jabbar best local synth)"
         return "qwen"
     if routing == "off":
@@ -2133,15 +2159,41 @@ def _offline():
         return False
 
 
+def _lean():
+    """Lean test profile: pin the optional retrieval layers so model A/B runs
+    differ only by the model, not by retrieval variance.
+
+    On (``MENTAT_LEAN=1``) the pipeline skips the HyDE rewrite and the
+    entity-graph block. Off, the engine behaves exactly as before — this only
+    changes what the *bench* sees, never the default answer path. Env-only on
+    purpose, so it never becomes a user-facing setting.
+    """
+    return bool(os.getenv("MENTAT_LEAN"))
+
+
+def _det_enabled():
+    """Thufir deterministic-answer path (on by default).
+
+    Count questions are computed by the deterministic census anyway, so the
+    writer was only reformatting numbers — skipping it is exact, instant, and
+    heat-free. Set ``MENTAT_NO_DETERMINISTIC=1`` to A/B against the writer.
+    """
+    return not os.getenv("MENTAT_NO_DETERMINISTIC")
+
+
 async def query_llm(prompt, system_prompt=None, history_messages=None, **kwargs):
     if _offline():
-        chosen = resolve_model(_ROUTE_OVERRIDE or "")
-        local = chosen if chosen and "qwen" in chosen else OLLAMA_LLM_MODEL
+        chosen = resolve_model(_ROUTE_OVERRIDE or _load_settings().get("model") or "")
+        # Honor an explicitly chosen local model (qwen / qwen-deep).
+        if chosen and "qwen" in chosen.lower():
+            local = chosen
+        else:
+            local = OLLAMA_LLM_MODEL
         return await ollama_llm(
             prompt,
             system_prompt=system_prompt,
             history_messages=history_messages,
-            local_model=local,
+            local_model=local or OLLAMA_LLM_MODEL,
             **kwargs,
         )
     settings = _load_settings()
@@ -2182,15 +2234,49 @@ async def query_llm(prompt, system_prompt=None, history_messages=None, **kwargs)
     )
 
 
-OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 
 
 _EMBED_CACHE = {}
 
 
-async def nomic_embed(texts, context="document", **kwargs):
-    import ollama
+# Persistent HTTP clients (D3): reuse connections instead of dialing per call.
+# Keyed by event loop so a client is never reused across a closed loop.
+_CLIENT_CACHE = {}
 
+
+def _loop_id():
+    try:
+        return id(asyncio.get_running_loop())
+    except RuntimeError:
+        return 0
+
+
+def _cached_ollama_client():
+    key = ("ollama", _loop_id())
+    c = _CLIENT_CACHE.get(key)
+    if c is None:
+        import ollama
+        c = ollama.AsyncClient(host=OLLAMA_HOST, timeout=60)
+        _CLIENT_CACHE[key] = c
+        if len(_CLIENT_CACHE) > 12:
+            _CLIENT_CACHE.clear()
+    return c
+
+
+def _cached_openai_client(base_url, api_key, timeout):
+    key = ("openai", base_url, api_key, float(timeout or 0), _loop_id())
+    c = _CLIENT_CACHE.get(key)
+    if c is None:
+        from openai import AsyncOpenAI
+        c = AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
+        _CLIENT_CACHE[key] = c
+        if len(_CLIENT_CACHE) > 24:
+            _CLIENT_CACHE.clear()
+    return c
+
+
+async def nomic_embed(texts, context="document", **kwargs):
     # Cache both query and document embeddings: the librarian embeds the same
     # query text as a document on every angle/sweep, so this turns ~15
     # re-embeddings per probe into one. Keyed by context so the two prefixes
@@ -2205,27 +2291,24 @@ async def nomic_embed(texts, context="document", **kwargs):
     prefix = prefixes.get(context)
     if prefix:
         texts = [prefix + text for text in texts]
-    client = ollama.AsyncClient(host=OLLAMA_HOST, timeout=60)
-    try:
-        for attempt in (1, 2):
-            try:
-                data = await client.embed(
-                    model=OLLAMA_EMBED_MODEL,
-                    input=texts,
-                    keep_alive=OLLAMA_KEEP_ALIVE,
-                )
-                result = np.array(data["embeddings"])
-                if cache_key is not None:
-                    if len(_EMBED_CACHE) > 256:
-                        _EMBED_CACHE.clear()
-                    _EMBED_CACHE[cache_key] = result
-                return result
-            except Exception:
-                if attempt == 2:
-                    raise
-                await asyncio.sleep(1.0)
-    finally:
-        await client._client.aclose()
+    client = _cached_ollama_client()
+    for attempt in (1, 2):
+        try:
+            data = await client.embed(
+                model=OLLAMA_EMBED_MODEL,
+                input=texts,
+                keep_alive=OLLAMA_KEEP_ALIVE,
+            )
+            result = np.array(data["embeddings"])
+            if cache_key is not None:
+                if len(_EMBED_CACHE) > 256:
+                    _EMBED_CACHE.clear()
+                _EMBED_CACHE[cache_key] = result
+            return result
+        except Exception:
+            if attempt == 2:
+                raise
+            await asyncio.sleep(1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -2729,9 +2812,9 @@ def _fts_count(term):
 
 # ---------------------------------------------------------------------------
 # Persistent vector store (SQLite-vec) — on-disk, restart-safe, incremental.
-# Imports vectors from LightRAG's nano-vectordb JSON once, then serves the
-# librarian's semantic search. Scales with more books without whole-file
-# rewrites or full reloads.
+# One-time import of a legacy nano-vectordb JSON, then serves the librarian's
+# semantic search. Scales with more books without whole-file rewrites or full
+# reloads.
 # ---------------------------------------------------------------------------
 
 _VEC_DB = None
@@ -3867,7 +3950,61 @@ def _render_memory_block(facts):
     )
 
 
-async def _librarian_search(rag, query, k=5, hyde_text=None, embedding=None, book_filter=None):
+_RANK_PRIOR = {}
+_RANK_PRIOR_TS = 0.0
+_RANK_PRIOR_TTL = 300.0
+
+
+def _learn2rank_enabled():
+    """Prescience 6a: learn-to-rank from citation telemetry (on by default).
+
+    A held-out check against `eval.py --gold` (which never calls `ask()`, so it
+    is not in the citation telemetry) showed no regression and less flakiness.
+    Set ``MENTAT_NO_LEARN2RANK=1`` to disable for A/B.
+    """
+    return not os.getenv("MENTAT_NO_LEARN2RANK")
+
+
+def _rank_prior():
+    """{chunk_id: smoothed citation rate} from telemetry (past → present).
+
+    Which chunks the answers actually cited is the strongest relevance signal we
+    have; a Laplace-smoothed rate nudges ranking toward them. Cached with a TTL;
+    rebuilt cheaply from a single grouped query.
+    """
+    global _RANK_PRIOR, _RANK_PRIOR_TS
+    now = time.time()
+    if _RANK_PRIOR and now - _RANK_PRIOR_TS < _RANK_PRIOR_TTL:
+        return _RANK_PRIOR
+    prior = {}
+    try:
+        conn = sqlite3.connect(TELEMETRY_PATH)
+        rows = conn.execute(
+            "SELECT chunk_id, count(*) AS app, sum(cited) AS cit FROM retrieval "
+            "WHERE chunk_id IS NOT NULL AND chunk_id != '' "
+            "GROUP BY chunk_id HAVING app >= 3"
+        ).fetchall()
+        conn.close()
+        for cid, app, cit in rows:
+            prior[cid] = (float(cit or 0) + 1.0) / (float(app) + 3.0)
+    except Exception:
+        prior = {}
+    _RANK_PRIOR = prior
+    _RANK_PRIOR_TS = now
+    return prior
+
+
+def _rank_boost(cid):
+    """Small additive bonus (<=4) for chunks that historically get cited."""
+    if not _learn2rank_enabled() or not cid:
+        return 0.0
+    rate = _rank_prior().get(cid)
+    if not rate:
+        return 0.0
+    return max(0.0, min(4.0, (rate - 0.25) * 12.0))
+
+
+async def _librarian_search(query, k=5, hyde_text=None, embedding=None, book_filter=None):
     """Semantic + literal search across the whole index. Returns passages.
 
     BOTH passes feed ONE unified ranking: semantic hits carry a moderate base
@@ -3884,6 +4021,7 @@ async def _librarian_search(rag, query, k=5, hyde_text=None, embedding=None, boo
             return
         if cid in _NEGATIVE_CHUNKS:
             score *= 0.9  # soft negative: user reasked/stopped this answer
+        score += _rank_boost(cid)  # Prescience 6a (no-op unless enabled)
         if excerpt is None:
             snippet = re.sub(r"\n{3,}", "\n\n", c.get("content", "")[:360])
             excerpt = "…" + snippet + "…"
@@ -3891,7 +4029,7 @@ async def _librarian_search(rag, query, k=5, hyde_text=None, embedding=None, boo
         if cur is None or score > cur[0]:
             best[cid] = [score, excerpt, c]
 
-    # semantic (vector) pass — sqlite-vec first, LightRAG's vdb as fallback
+    # semantic (vector) pass over the sqlite-vec store
     try:
         emb = embedding
         if emb is None:
@@ -4006,7 +4144,26 @@ async def _librarian_search(rag, query, k=5, hyde_text=None, embedding=None, boo
     ]
 
 
+_HELPER_STATS = {"calls": 0, "sec": 0.0}
+_LAST_PATH = {"v": ""}  # Lisan al-Gaib path decision for the current ask
+
+
 async def _fast_llm(prompt, system_prompt=None):
+    """Cheap, fast model for planning/searching (flash when online, else local).
+
+    Wrapped to accumulate per-ask helper-call cost (calls + wall seconds): with
+    the writer's token count this is the honest "heat" proxy — how much model
+    work an answer took.
+    """
+    _t0 = time.time()
+    _HELPER_STATS["calls"] += 1
+    try:
+        return await _fast_llm_call(prompt, system_prompt=system_prompt)
+    finally:
+        _HELPER_STATS["sec"] += time.time() - _t0
+
+
+async def _fast_llm_call(prompt, system_prompt=None):
     """Cheap, fast model for planning/searching (flash when online, else local).
 
     ``planner_model`` in settings can pin the librarian/planner to a specific
@@ -4042,8 +4199,8 @@ async def _fast_llm(prompt, system_prompt=None):
                     f"{'planner' if cand == planner and planner else 'flash'}: {str(exc)[:120]}",
                 )
     return await ollama_llm(
-        prompt, system_prompt=system_prompt, local_model=OLLAMA_DEEP_MODEL,
-        think=False,
+        prompt, system_prompt=system_prompt, local_model=OLLAMA_FAST_MODEL,
+        think=False, keep_alive=OLLAMA_FAST_KEEP_ALIVE,
     )
 
 
@@ -4209,93 +4366,147 @@ def _parse_analysis_json(raw):
     return out
 
 
-async def _expand_query(question):
-    """Tier 1: comprehend the question AND resolve the books it names.
+def _count_named_books(question):
+    try:
+        return len(_named_books(question) or [])
+    except Exception:
+        return 0
 
-    The model understands the request the way a librarian would: what KIND
-    of answer is wanted (a count, quotes, a comparison...), the exact phrase
-    to hunt or count, which books/authors it refers to, and search angles.
-    Deterministic code later verifies everything the model proposes — this
-    call only decides WHAT to verify, never the numbers.
-    Returns {"kind", "phrase", "books", "angles", "scope_hint"}.
+
+def _plan_needed(question, kind):
+    """Lean Thinking: spend a planning call only when comprehension changes the
+    retrieval. Counts and simple quotes are handled deterministically (Thufir /
+    hunt) and never pay for planning; short factual lookups skip it too."""
+    if kind in ("count", "quotes"):
+        return False
+    if _is_argumentative(question):
+        return True
+    if _count_named_books(question) >= 2:
+        return True
+    if _has_universal_intent(question):
+        return True
+    if kind in ("concept", "compare", "commentary"):
+        return True
+    q = str(question or "").lower()
+    if any(w in q for w in ("say about", "according to", "discuss", "view on",
+                            "think about", "what does", "how does")):
+        return True
+    return _is_interpretive(question)
+
+
+def _is_argumentative(question):
+    q = str(question or "").lower()
+    return any(
+        w in q for w in (
+            "why", "argument", "thesis", "dialectic", "dialectical", "implication",
+            "significan", "compare", "contrast", "critique", "evaluate", "ontology",
+            "on the one hand", "contradiction", "nature of",
+        )
+    )
+
+
+def _is_hard_question(question, kind=None):
+    """Cheap signal that planning deserves the bigger model."""
+    if kind in ("compare", "commentary"):
+        return True
+    if _has_universal_intent(question):
+        return True
+    if _count_named_books(question) >= 2:
+        return True
+    return len(str(question or "").split()) > 18
+
+
+_PLAN_CACHE = {}
+
+
+async def _plan_question(question):
+    """Lean Thinking — ONE merged planning call.
+
+    Returns comprehension (kind/phrase/scope/books/angles) PLUS a hypothetical
+    passage (HyDE) PLUS counter-queries (dialectic) in a single model round trip.
+    Runs on the small helper by default; escalates to the writer model only for
+    genuinely hard questions. Cached per question; supplies `_analysis` so the
+    rest of the pipeline (kinds, census, strategy) sees the comprehension.
     """
-    out = {"kind": "", "phrase": "", "books": [], "angles": [], "scope_hint": ""}
-    if _offline():
-        _analysis_store(question, out)
-        return out
-    # Already comprehended this question earlier in the ask flow? Reuse it —
-    # _build_passages runs right after the strategy pre-pass.
-    cached = _analysis(question)
+    q = str(question or "")
+    hit = _PLAN_CACHE.get(q)
+    if hit is not None:
+        return hit
+    out = {"kind": "", "phrase": "", "scope_hint": "", "books": [], "angles": [],
+           "hypothetical": "", "counter_queries": []}
+    cached = _analysis(q)
     if any(cached.get(k) for k in ("kind", "phrase", "scope_hint", "books", "angles")):
-        return cached
+        out.update({k: cached.get(k) or out[k] for k in out})
+        return out
+
     titles = "; ".join(_clean_name(rel) for rel in sorted(_load_manifest()))
-    conv = _current_conv_id()
     prior_blk = ""
+    conv = _current_conv_id()
     prior_an = _prior_analysis(conv) if conv else {}
     if prior_an.get("question"):
         prior_blk = (
-            "Prior context (the user's PREVIOUS question in this conversation "
-            "and how it was understood):\n"
-            f"  question: {str(prior_an['question'])[:400]}\n"
-            "  understood as kind=%s, phrase=%r, scope_hint=%r\n"
-            % (
-                prior_an.get("kind", ""),
-                str(prior_an.get("phrase", ""))[:200],
-                str(prior_an.get("scope_hint", ""))[:200],
-            )
+            "Prior context (previous question + how it was understood): "
+            f"{str(prior_an.get('question'))[:300]} | kind={prior_an.get('kind','')} "
+            f"phrase={str(prior_an.get('phrase',''))[:120]}\n"
         )
     prompt = (
-        "For the library question below, understand what is being asked and "
-        "answer as JSON. The question may be phrased any way at all; your job "
-        "is intent, not keywords — handle casual phrasing, typos, and follow-ups.\n"
-        "Fields:\n"
-        "  kind: one of \"count\" (wants a number/occurrences of a phrase), "
-        "\"quotes\" (wants verbatim passages), \"compare\" (compares books), "
-        "\"research\" (needs evidence from several books), \"fact\" (a simple "
-        "question), \"chat\" (casual, no library needed).\n"
-        "  phrase: ONLY when kind is count or quotes — the exact text to look "
-        "for or count, written as it would appear in the book (include words "
-        "like 'the' if the book would; e.g. \"eyes of the Ibad\"); keep any "
-        "user quotation marks if the user quoted something verbatim.\n"
-        "  scope_hint: the books/library-part the user points at (e.g. \"dune "
-        "series\", \"all books\", \"the quran\"), or \"\".\n"
-        "  angles: search terms worth trying: named works, exact phrases, key "
-        "concepts, synonyms.\n"
-        "  books: which books/authors the question refers to, using names "
-        "EXACTLY as they appear in the available-books list.\n"
+        "Understand this library question and return ONE JSON object. Fields:\n"
+        "  kind: count|quotes|concept|compare|research|fact|chat\n"
+        '  phrase: exact text to count/quote (only for count/quotes), else ""\n'
+        '  scope_hint: the books/library-part pointed at, or ""\n'
+        "  books: book titles the question refers to, EXACTLY as in the list\n"
+        "  angles: 2-5 search phrases (named works, exact phrases, key concepts)\n"
+        "  hypothetical: ONE sentence that would answer it, phrased as if quoted from a book\n"
+        "  counter_queries: for argumentative/comparative questions, 1-3 search phrases\n"
+        "    that would find OPPOSING or complicating evidence; else []\n"
         f"{prior_blk}"
-        "CONTINUATION RULE: if THIS question is a follow-up to the prior one "
-        "('the whole series', 'what about the quran?', 'now count it', 'find "
-        "them all'), inherit the prior phrase/kind and only change what the "
-        "user changed (usually the scope). Answer for THIS question.\n"
         f"Available books: {titles}\n"
         f"Question: {question}\n"
-        'Return ONLY JSON: {"kind": "...", "phrase": "...", "scope_hint": "...", '
-        '"angles": ["..."], "books": ["..."]}'
+        'Return ONLY JSON: {"kind":"","phrase":"","scope_hint":"","books":[],'
+        '"angles":[],"hypothetical":"","counter_queries":[]}'
     )
+    use_writer = _offline() and _is_hard_question(question, _heuristic_kind(question))
     for attempt in (1, 2):
         try:
-            raw = await _fast_llm(prompt if attempt == 1 else
-                "One line JSON for this: kind, phrase (only if it asks to count/"
-                f"quote something exact), scope_hint, angles, books. Question: {question}\n"
-                '{"kind": "...", "phrase": "...", "scope_hint": "", '
-                '"angles": [], "books": []}')
+            if use_writer and attempt == 1:
+                _HELPER_STATS["calls"] += 1
+                raw = await ollama_llm(prompt, local_model=OLLAMA_LLM_MODEL, think=False)
+            else:
+                raw = await _fast_llm(
+                    prompt if attempt == 1 else
+                    "One line JSON: kind, phrase, scope_hint, books, angles, "
+                    f"hypothetical, counter_queries. Question: {question}\n"
+                    '{"kind":"","phrase":"","scope_hint":"","books":[],"angles":[],'
+                    '"hypothetical":"","counter_queries":[]}'
+                )
             data = _parse_analysis_json(raw) or {}
-            kind = str(data.get("kind") or "").strip().lower()[:20]
-            phrase = str(data.get("phrase") or "").strip()
-            if phrase or kind:
-                out["kind"] = kind
-                out["phrase"] = phrase
+            if data:
+                out["kind"] = str(data.get("kind") or "").strip().lower()[:20]
+                out["phrase"] = str(data.get("phrase") or "").strip()
                 out["scope_hint"] = str(data.get("scope_hint") or "").strip()
-                out["angles"] = [str(x).strip() for x in data.get("angles", []) if str(x).strip()][:8]
-                out["books"] = [str(x).strip() for x in data.get("books", []) if str(x).strip()][:4]
-                break
+                out["angles"] = [str(x).strip() for x in (data.get("angles") or []) if str(x).strip()][:8]
+                out["books"] = [str(x).strip() for x in (data.get("books") or []) if str(x).strip()][:4]
+                out["hypothetical"] = str(data.get("hypothetical") or "").strip()[:400]
+                out["counter_queries"] = [
+                    str(x).strip() for x in (data.get("counter_queries") or []) if str(x).strip()
+                ][:3]
+                if out["kind"] or out["phrase"] or out["hypothetical"] or out["angles"]:
+                    break
         except Exception:
             continue
-    _analysis_store(question, out)
+    _analysis_store(q, out)
     if out.get("kind") or out.get("phrase") or out.get("scope_hint"):
-        _remember_analysis(question, out)
+        _remember_analysis(q, out)
+    if len(_PLAN_CACHE) > 128:
+        _PLAN_CACHE.clear()
+    _PLAN_CACHE[q] = out
     return out
+
+
+async def _expand_query(question):
+    """Comprehension via the merged planning call (back-compat entry point)."""
+    return await _plan_question(question)
+
 
 
 async def _planner(question, seen, rounds_left, scratch=None):
@@ -5361,6 +5572,7 @@ def _census_count_in(text, phrase_tokens):
 
 _CENSUS_MAX_BOOK_LINES = 36
 _CENSUS_MAX_CHAPTERS = 12
+_LAST_CENSUS = {}  # structured result of the last _render_census_report (Thufir)
 
 
 def _render_census_report(scope, phrase, question="", bare=False):
@@ -5411,6 +5623,7 @@ def _render_census_report(scope, phrase, question="", bare=False):
     zeros_skipped = 0
     head_total = 0
     related_rows = []  # (title, [(marker, count, snippet)])
+    work_rows = []     # (title, count, [chapters], apparatus_count)
     for it in scope:
         source_docs = []
         rels = []
@@ -5496,6 +5709,10 @@ def _render_census_report(scope, phrase, question="", bare=False):
                 f"not counted)"
             )
         lines.append(f"- {_escape_format(it['title'])} — {work_total}: {where}{app_note}{dup}")
+        work_rows.append(
+            (it["title"], work_total, [c[0] for c in chapters[:8]],
+             sum(n for _, n, _ in apparatus))
+        )
         for marker, n, ex in chapters[:4]:
             if ex:
                 lines.append(f"    · {_escape_format(marker)}: {_escape_format(ex[:220])}")
@@ -5525,6 +5742,19 @@ def _render_census_report(scope, phrase, question="", bare=False):
             f"the phrase (every work in scope was swept)."
         )
     body = "\n".join(lines)
+    if not bare:
+        global _LAST_CENSUS
+        _LAST_CENSUS = {
+            "phrase": phrase,
+            "total": total,
+            "scanned": scanned,
+            "works": work_rows,
+            "head": head,
+            "head_total": head_total,
+            "zeros_skipped": zeros_skipped,
+            "related": related_rows[:6],
+            "scope": [it["title"] for it in scope],
+        }
     if bare:
         # Multi-variant censuses merge several bare bodies under one header.
         return body
@@ -5636,6 +5866,48 @@ def _census_enumeration_guard(question, total):
         "examples ONLY if they appear verbatim in the evidence above. Never "
         "fabricate a quote, chapter, page, or verse number."
     )
+
+
+def _thufir_census_answer():
+    """Thufir: assemble a count answer directly from the deterministic census.
+
+    The census already did the full-text scan; the writer was only ever
+    reformatting its numbers. Formatting them here is exact, instant, and
+    heat-free. Returns "" when no verified count exists (caller falls back to
+    the writer). Applied only when the census block for THIS question ran.
+    """
+    c = _LAST_CENSUS or {}
+    total = c.get("total")
+    if total is None:
+        return ""
+    phrase = str(c.get("phrase") or "").strip()
+    scanned = int(c.get("scanned") or 0)
+    works = c.get("works") or []
+    if not phrase and not works:
+        return ""
+    out = [
+        f'**“{phrase}” appears {total} time(s)** across {scanned} book(s) in the '
+        "library — an exact, case-insensitive count over the story text "
+        "(duplicates of a work/chapter counted once)."
+    ]
+    for title, count, chapters, app in works:
+        if not count and not chapters:
+            continue
+        where = ", ".join(chapters) if chapters else "nowhere"
+        note = f" (+{app} in front/back matter, not counted)" if app else ""
+        out.append(f"- **{title}** — {count}: {where}{note}")
+    zeros = int(c.get("zeros_skipped") or 0)
+    if zeros:
+        out.append(f"- … and {zeros} further work(s) with no occurrence.")
+    rel = c.get("related") or []
+    head = str(c.get("head") or "")
+    if rel and head:
+        out.append("")
+        out.append(
+            f"_Related wording (not part of the count): the word “{head}” also "
+            "appears without the exact phrase in some works._"
+        )
+    return "\n".join(out)
 
 
 def _census_ctx(question, strategy):
@@ -6084,6 +6356,29 @@ def _retrieval_strategy(question, score):
     return "expand"
 
 
+def _answer_path(question, strategy, kind):
+    """Lisan al-Gaib: the single routing decision for a question.
+
+    Returns "fast" | "standard" | "heavy". Heavy questions (cross-book synthesis)
+    get the full pipeline; fast questions (short, simple facts) get a trimmed
+    evidence budget so they finish quicker and cooler. Counts/quotes are
+    "standard" — they need real retrieval (or Thufir), not a short circuit.
+    """
+    q = str(question or "").lower()
+    if strategy == "universal" or kind in ("compare", "commentary"):
+        return "heavy"
+    if (
+        _has_universal_intent(question)
+        or _has_census_intent(question)
+        or _has_quote_intent(question)
+        or _has_hunt_intent(question)
+    ):
+        return "standard"
+    if len(q.split()) <= 12:
+        return "fast"
+    return "standard"
+
+
 def _has_quote_intent(question):
     """Wants verbatim passages with citations. The classifier's ``quotes``
     kind is authoritative when present; the keyword list is the offline
@@ -6356,8 +6651,8 @@ def _bold_paragraphs(seg):
 def _escape_format(text):
     """Escape braces so blocks appended to the system TEMPLATE survive .format().
 
-    LightRAG runs .format() on the whole system prompt; a literal '{' in a
-    passage (common in the Study Quran, Kojève, Boer) would raise
+    The system prompt is built with .format(); a literal '{' in a passage
+    (common in the Study Quran, Kojève, Boer) would raise
     'Single { encountered' and the answer silently returns empty.
     """
     return str(text).replace("{", "{{").replace("}", "}}")
@@ -6407,7 +6702,10 @@ def _long_citation_window(p, width=3200):
             if idx < 0:
                 return str(p.get("content") or p.get("excerpt", ""))[:width]
             start = max(0, idx - 140)
-            return text[start : start + width]
+            # Snap the end to a sentence/paragraph boundary so a long window
+            # never cuts mid-word (the reader paginates this text).
+            end = _snap_sentence_end(text, min(len(text), start + width), forward=400)
+            return text[start:end]
     except Exception:
         pass
     return str(p.get("content") or p.get("excerpt", ""))[:width]
@@ -6567,7 +6865,7 @@ def _fts_own_hits(terms, own_ids, limit_ids=2000):
         return 0
 
 
-async def _canary_check(rag, rel, k=4):
+async def _canary_check(rel, k=4):
     """Verify one book is retrievable. Returns [(check_name, ok, detail), ...]."""
     import collections
 
@@ -6594,9 +6892,9 @@ async def _canary_check(rag, rel, k=4):
     def own_hit(ps):
         return sum(1 for p in ps if p.get("chunk_id") in own_ids)
 
-    ps = await _librarian_search(rag, fname, k=k)
+    ps = await _librarian_search(fname, k=k)
     if own_hit(ps) == 0 and folder:
-        ps = ps + await _librarian_search(rag, folder, k=k)
+        ps = ps + await _librarian_search(folder, k=k)
 
     # index-level reachability: the filename's own tokens find own chunks
     tokens = [
@@ -6763,7 +7061,7 @@ def _prioritize_named(question, results, extra_names=None):
     return ordered_prio, rest
 
 
-async def _probe_passages(rag, question, k=8):
+async def _probe_passages(question, k=8):
     """Context preview for `brain probe` — no LLM calls at all.
 
     Runs the librarian search (semantic + keyword) and the named-book
@@ -6794,7 +7092,7 @@ async def _probe_passages(rag, question, k=8):
             )
         except Exception:
             pass
-    _add(await _librarian_search(rag, question, k=k))
+    _add(await _librarian_search(question, k=k))
     # one extra deterministic search: content terms + named books, which
     # mirrors what the expansion tier adds (e.g. "mercy dune").
     terms = _derive_terms(question)
@@ -6802,7 +7100,7 @@ async def _probe_passages(rag, question, k=8):
     content = [t for t in terms if t not in named]
     if content and named:
         try:
-            _add(await _librarian_search(rag, " ".join(content[:4] + named), k=k))
+            _add(await _librarian_search(" ".join(content[:4] + named), k=k))
         except Exception:
             pass
     # Scope sweep: every demanded work gets its own scoped search (no LLM),
@@ -6822,7 +7120,7 @@ async def _probe_passages(rag, question, k=8):
             continue
         kk = max(4, min(sweep_depth, k))
         try:
-            sp = await _librarian_search(rag, question, k=kk, book_filter=it["primary"])
+            sp = await _librarian_search(question, k=kk, book_filter=it["primary"])
         except Exception:
             sp = []
         if not sp:
@@ -6841,7 +7139,7 @@ async def _probe_passages(rag, question, k=8):
         keys = [bk for bk, _ in dist.most_common(4)]
         async def _shelf(bk):
             try:
-                return await _librarian_search(rag, question, k=4, book_filter=bk)
+                return await _librarian_search(question, k=4, book_filter=bk)
             except Exception:
                 return []
         for shelf_results in await asyncio.gather(*[_shelf(bk) for bk in keys]):
@@ -6904,7 +7202,7 @@ def _rrf_fuse(ranked_lists, k=60):
     return [first[c] for c in sorted(scores, key=lambda c: -scores[c])]
 
 
-async def _build_passages(rag, question, strategy):
+async def _build_passages(question, strategy):
     """Gather relevant passages across the whole index (Tier 1 + Tier 2)."""
     _RETRIEVAL_ERRORS.clear()
     results = []
@@ -6922,23 +7220,28 @@ async def _build_passages(rag, question, strategy):
     hyde = ""
     expansion = {}
     try:
-        hypo, exp = await asyncio.gather(
-            _hypothetical_passage(question),
-            _expand_query(question),
-            return_exceptions=True,
-        )
-        if isinstance(hypo, str):
-            hyde = hypo
-        if isinstance(exp, dict):
-            expansion = exp
+        # Lean Thinking: ONE merged planning call, and only when it will change
+        # how we retrieve. Counts and simple quotes skip it entirely.
+        if _plan_needed(question, _question_kind(question)) or _is_hard_question(question):
+            expansion = await _plan_question(question)
+            hyde = str(expansion.get("hypothetical") or "")
+        else:
+            expansion = _analysis(question) or {}
     except Exception:
-        pass
+        expansion = {}
 
     queries = [question]
     model_books = []
     if expansion:
-        queries += [a for a in expansion.get("angles", []) if a]
+        angles = [a for a in expansion.get("angles", []) if a]
         model_books = [b for b in expansion.get("books", []) if b]
+        # Dialectic: pull counter-evidence for argumentative questions.
+        counters = (
+            [c for c in expansion.get("counter_queries", []) if c]
+            if _is_argumentative(question)
+            else []
+        )
+        queries += angles[:4] + counters[:2]
     queries = queries[:6]
     _retrieval_note("embedding your question…")
     # Batch embeddings: one Ollama call for the HyDE doc, one for all queries.
@@ -6956,7 +7259,7 @@ async def _build_passages(rag, question, strategy):
     for q in queries:
         try:
             _lists.append(await _librarian_search(
-                rag, q, k=5,
+                q, k=5,
                 embedding=embeds.get("hyde") if q == question else embeds.get(q),
             ))
         except Exception as exc:
@@ -7017,7 +7320,7 @@ async def _build_passages(rag, question, strategy):
             for i, sq in enumerate(searches):
                 try:
                     _add(await _librarian_search(
-                        rag, sq, k=5,
+                        sq, k=5,
                         embedding=(np.expand_dims(semb[i], 0) if semb is not None else None),
                     ))
                 except Exception as exc:
@@ -7065,7 +7368,7 @@ async def _build_passages(rag, question, strategy):
             kk = max(kk, 8)  # a single demanded work gets a deep sweep
         try:
             sp = await _librarian_search(
-                rag, question, k=kk,
+                question, k=kk,
                 embedding=embeds.get("hyde"),
                 book_filter=it["primary"],
             )
@@ -7098,7 +7401,7 @@ async def _build_passages(rag, question, strategy):
         async def _shelf(bk):
             try:
                 return await _librarian_search(
-                    rag, question, k=4,
+                    question, k=4,
                     embedding=embeds.get("hyde"),
                     book_filter=bk,
                 )
@@ -7548,13 +7851,13 @@ def _get_reranker():
 
 
 def warm_models():
-    """Load the local reranker and the index caches up front, so the *first*
-    question doesn't pay the model-load / cold-index cost. Best-effort: any
-    failure is swallowed (a cold first question still works, just slower).
-
-    Run from a daemon thread at engine start (see server.py); never blocks boot.
+    """Optionally preload the reranker + index caches so the *first* question
+    doesn't pay the cold-load cost. OFF by default so the idle engine stays tiny
+    (~100 MB instead of ~1.9 GB: reranker ~800 MB + spans ~335 MB + vocab
+    ~187 MB); everything loads lazily on first use. Set ``MENTAT_WARM_MODELS=1``
+    to preload. Run from a daemon thread at engine start (see server.py).
     """
-    if os.getenv("MENTAT_WARM_MODELS", "1") == "0":
+    if os.getenv("MENTAT_WARM_MODELS", "0") != "1":
         return
     try:
         _get_reranker().predict([["warm up", "the litany against fear"]])
@@ -7581,7 +7884,7 @@ def warm_models():
 
 
 async def _rerank_model(query, documents, top_n=8, **kwargs):
-    """Signature LightRAG expects -> [{'index': i, 'relevance_score': s}]."""
+    """Reranker signature -> [{'index': i, 'relevance_score': s}]."""
     try:
         model = _get_reranker()
         pairs = [[query, str(d)[:800]] for d in documents]
@@ -7606,20 +7909,6 @@ async def _rerank_passages(question, passages, top_n=8):
         return [passages[i] for i in order[:top_n]]
     except Exception:
         return passages[:top_n]
-
-
-async def _hypothetical_passage(question):
-    """HyDE: a hypothetical excerpt that would answer the question."""
-    if _offline():
-        return ""  # local retrieval embeds the question directly
-    prompt = (
-        "Write a 2-3 sentence hypothetical passage from a book that would "
-        "answer this question. Read like an actual excerpt.\nQuestion: " + question
-    )
-    try:
-        return (await _fast_llm(prompt) or "").strip()
-    except Exception:
-        return ""
 
 
 async def _revise_for_argument(answer, question):
@@ -7767,22 +8056,106 @@ def _citation_index():
     return _CITATION_INDEX
 
 
-def _sentence_around(text, needle, span=520):
-    """A self-contained quote window around `needle` (or the head of `text`)."""
-    text = re.sub(r"[ \t]+", " ", str(text or "")).strip()
+_SENT_END_RE = re.compile(r"[.!?…][\"'”’)\]]?(?=\s+[A-Z\"'“‘(]|\n|$)")
+
+
+def _snap_to_word(text, i, forward=True):
+    """Nearest word boundary from index ``i`` (never splits a word)."""
+    n = len(text)
+    if forward:
+        j = max(0, min(n, i))
+        while j < n and not text[j].isspace():
+            j += 1
+        return j
+    j = max(0, min(n, i))
+    while j > 0 and not text[j - 1].isspace():
+        j -= 1
+    return j
+
+
+def _snap_sentence_start(text, i, backoff=240):
+    """Move ``i`` back to the nearest sentence/paragraph start (bounded)."""
+    lo = max(0, i - backoff)
+    ends = list(_SENT_END_RE.finditer(text, lo, i))
+    if ends:
+        return ends[-1].end()
+    p = text.rfind("\n", lo, i)
+    if p >= 0:
+        return p + 1
+    return _snap_to_word(text, i, forward=False)
+
+
+def _snap_sentence_end(text, i, forward=320):
+    """Move ``i`` forward to the end of the current sentence (bounded)."""
+    hi = min(len(text), i + forward)
+    m = _SENT_END_RE.search(text, i, hi)
+    if m:
+        return m.end()
+    p = text.find("\n", i, hi)
+    if p >= 0:
+        return p
+    return _snap_to_word(text, i, forward=True)
+
+
+def _quote_window(text, needle, target=520):
+    """A self-contained, sentence-complete quote window around ``needle``.
+
+    Never cuts mid-word or mid-sentence: the start snaps back to a sentence
+    boundary and the end snaps forward to one (bounded), with ellipses only when
+    the window genuinely clips the source. Falls back to the head of ``text``
+    when the needle is absent.
+    """
+    text = str(text or "").strip()
     if not text:
         return ""
     idx = text.lower().find(str(needle or "").lower()) if needle else -1
     if idx < 0:
-        return text[:span].strip()
-    start = max(0, idx - span // 3)
-    end = min(len(text), start + span)
+        start = 0
+        end = _snap_sentence_end(text, min(len(text), target), forward=240)
+    else:
+        start = _snap_sentence_start(text, max(0, idx - target // 3), backoff=240)
+        # Prefer the LAST complete sentence that fits within the target window;
+        # only reach forward if there is no sentence boundary in range. This
+        # keeps the quote a set of whole sentences rather than a dangling tail.
+        raw_end = min(len(text), start + target)
+        lo = start + max(120, target // 2)
+        ends = list(_SENT_END_RE.finditer(text, lo, raw_end))
+        if ends:
+            end = ends[-1].end()
+        else:
+            end = _snap_sentence_end(text, raw_end, forward=300)
     snippet = text[start:end].strip()
-    if start > 0:
-        cut = snippet.find(". ")
-        if 0 <= cut < 140:
-            snippet = snippet[cut + 2 :].strip()
+    if not snippet:
+        snippet = text[:target].strip()
+    # No ellipsis markers: the reader highlights this exact string inside the
+    # passage, so it must be a verbatim substring of `text`.
     return snippet
+
+
+def _sentence_around(text, needle, span=520):
+    """Backwards-compatible name for `_quote_window` (sentence-complete)."""
+    return _quote_window(text, needle, target=span)
+
+
+def _norm_cite_book(s):
+    """Normalize a book label for citation matching: fold diacritics, strip
+    markdown/punctuation/extension, lowercase. So `*Dune*`, `Kojève`, and
+    `Frank Herbert - Dune 1 - Dune.pdf` all normalize to comparable strings."""
+    s = unicodedata.normalize("NFKD", str(s or ""))
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.lower().replace("’", "'")
+    s = re.sub(r"[*_`]", "", s)
+    s = re.sub(r"\.(?:epub|pdf|txt|mobi|azw3|docx?)\b", "", s)
+    s = re.sub(r"[^a-z0-9' ]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _norm_cite_loc(s):
+    """Normalize a location label: `Ch. 24` → `chapter 24`, drop punctuation."""
+    s = str(s or "").lower().replace("’", "'")
+    s = re.sub(r"\bch\b\.?\s*", "chapter ", s)
+    s = re.sub(r"[^a-z0-9:._\- ]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def _passage_source(book, loc, hint=""):
@@ -7802,27 +8175,84 @@ def _passage_source(book, loc, hint=""):
     if hit is not None:
         return hit
 
-    nb, nl = book.lower(), loc.lower()
+    nb, nl = _norm_cite_book(book), _norm_cite_loc(loc)
     index = _citation_index()
     candidates = []
 
-    # Prefer the exact passages that grounded the last answer: they are the
+    # Resolve the book against the index's own book set: exact normalized, then
+    # subset/prefix, then fuzzy (difflib) — so "*Dune*", "Kojeve", and "God
+    # Emperor" all reach the real book.
+    book_norms = {}
+    for (b, _l) in index.keys():
+        book_norms.setdefault(b, _norm_cite_book(b))
+    resolved = None
+    for b, n in book_norms.items():
+        if n == nb:
+            resolved = b
+            break
+    if resolved is None and nb:
+        subs = [b for b, n in book_norms.items() if nb in n or n in nb]
+        if subs:
+            resolved = max(subs, key=lambda b: len(book_norms[b]))
+    if resolved is None and nb:
+        close = difflib.get_close_matches(nb, list(book_norms.values()), n=1, cutoff=0.72)
+        if close:
+            for b, n in book_norms.items():
+                if n == close[0]:
+                    resolved = b
+                    break
+    resolved_norm = book_norms.get(resolved) if resolved else nb
+
+    def _book_ok(b):
+        n = book_norms.get(b) or _norm_cite_book(b)
+        return n == resolved_norm or n == nb
+
+    def _loc_ok(l):
+        if not nl:
+            return True
+        nlb = _norm_cite_loc(l)
+        return bool(nlb) and (nlb == nl or nl in nlb or nlb in nl)
+
+    # 1) Prefer the exact passages that grounded the last answer: they are the
     # real source, so same-chapter ambiguity is resolved by quote overlap.
     for p in _LAST_ANSWER_PASSAGES:
         b, l = _citation_parts(p)
-        if not b:
-            continue
-        cb, cl = b.lower(), l.lower()
-        if cb == nb and (cl == nl or (nl and (nl in cl or cl in nl))):
+        if b and _book_ok(b) and _loc_ok(l):
             candidates.append(p)
 
+    # 2) index: exact normalized (book, loc)
     if not candidates:
-        candidates = list(index.get((nb, nl), []))
-        if not candidates:
-            # lenient: same book, loc is a prefix/containment (anchor drift)
-            for (b, l), chunks in index.items():
-                if b == nb and nl and (nl in l or l in nl):
-                    candidates.extend(chunks)
+        for (b, l), chunks in index.items():
+            if _book_ok(b) and (not nl or _norm_cite_loc(l) == nl):
+                candidates.extend(chunks)
+    # 3) containment (anchor drift)
+    if not candidates and nl:
+        for (b, l), chunks in index.items():
+            if not _book_ok(b):
+                continue
+            nlb = _norm_cite_loc(l)
+            if nl in nlb or nlb in nl:
+                candidates.extend(chunks)
+    # 4) loc-by-segment (multi-part locs, narrative tails)
+    if not candidates and nl:
+        segs = [s.strip() for s in re.split(r"[;·,]", nl) if len(s.strip()) >= 3]
+        for (b, l), chunks in index.items():
+            if not _book_ok(b):
+                continue
+            nlb = _norm_cite_loc(l)
+            if any(s in nlb for s in segs):
+                candidates.extend(chunks)
+    # 5) hint-overlap fallback across the resolved book — the answer quotes the
+    # source, so the chunk it echoes is almost always the right one.
+    if not candidates and hint:
+        pool = [c for (b, l), chunks in index.items() if _book_ok(b) for c in chunks]
+        if pool:
+            candidates = sorted(
+                pool,
+                key=lambda c: -_hint_overlap(
+                    c.get("content") or c.get("excerpt") or "", hint
+                ),
+            )[:8]
     if not candidates:
         return None
 
@@ -7838,14 +8268,23 @@ def _passage_source(book, loc, hint=""):
 
     best = max(candidates, key=_score)
 
-    quote = _sentence_around(
-        best.get("content") or best.get("excerpt"), terms[0] if terms else "", 520
+    text = _long_citation_window(best, width=5000)
+    # Derive the quote FROM the passage window, so it is a verbatim substring —
+    # the reader tints it and the card must show the exact quoted span, complete.
+    needle = (
+        terms[0] if terms
+        else str(best.get("excerpt") or best.get("content") or "")[:60]
     )
+    quote = _quote_window(text, needle, 520)
+    if not quote:
+        quote = _sentence_around(
+            best.get("content") or best.get("excerpt"), needle, 520
+        )
     out = {
         "book": book,
         "loc": loc,
         "quote": quote,
-        "text": _long_citation_window(best, width=5000),
+        "text": text,
     }
     if len(_PASSAGE_CACHE) > 64:
         _PASSAGE_CACHE.clear()
@@ -7907,26 +8346,47 @@ def _ensure_quote_attribution(answer, passages):
     return "".join(out), fixed
 
 
+def _norm_quote_text(s):
+    """Normalize for verbatim comparison: straight quotes, de-hyphenate line
+    breaks, collapse whitespace, lowercase. Lets a real quote match across the
+    OCR/line-break differences that previously caused false 'ungrounded' flags."""
+    s = str(s or "").lower()
+    s = s.translate(str.maketrans({"“": '"', "”": '"', "‘": "'", "’": "'"}))
+    s = re.sub(r"-\s*\n\s*", "", s)   # de-hyphenate a wrapped word
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
 def _verify_quotes(answer, passages):
-    """Quoted strings in the answer that can't be grounded in the provided passages."""
+    """Quoted strings in the answer that can't be grounded in the provided passages.
+
+    A quote counts as grounded when it appears VERBATIM (after normalization:
+    quotes/line-breaks/case) somewhere in the passages — so real quotes stop
+    being flagged for OCR/hyphenation drift. Only if it isn't verbatim do we
+    fall back to a high word-overlap check (0.8) to catch near-paraphrase
+    masquerading as a quote.
+    """
     quoted = re.findall(
         r'(?<![A-Za-z0-9])["“]([^"“”]{20,})["”](?![A-Za-z0-9])', answer or ""
     )
     if not quoted:
         return []
-    blob = " ".join(
-        str(p.get("content") or p.get("excerpt", "")).lower() for p in passages
+    blob = _norm_quote_text(
+        " ".join(str(p.get("content") or p.get("excerpt", "")) for p in passages)
     )
     blob_words = set(re.findall(r"[a-z0-9']{3,}", blob))
     ungrounded = []
     for q in quoted:
-        low = re.sub(r"\s+", " ", q.lower()).strip()
+        low = _norm_quote_text(q)
         words = re.findall(r"[a-z0-9']{3,}", low)
         if not words:
             continue
+        if low and low in blob:
+            continue  # verbatim in the evidence
         matched = sum(1 for w in words if w in blob_words)
-        # 0.5: tolerate paraphrase while still catching fabrications
-        if matched / len(words) < 0.5:
+        # 0.8: strict enough to catch fabrications, loose enough for a stray
+        # connector while still requiring the quote to essentially exist.
+        if matched / len(words) < 0.8:
             ungrounded.append(q)
     return ungrounded
 
@@ -8982,6 +9442,18 @@ TELEMETRY_PATH = STORAGE_DIR / "telemetry.db"
 _LAST_RETRIEVAL = []
 
 
+def _proc_usage():
+    """(cpu_seconds, peak_rss_mb) for this process — dependency-free.
+
+    ``ru_maxrss`` is bytes on macOS and KiB on Linux; normalise to MB so the
+    telemetry is portable. Used to make "the engine runs hot" measurable
+    rather than anecdotal: every answer records its CPU seconds and peak RSS.
+    """
+    r = resource.getrusage(resource.RUSAGE_SELF)
+    rss_bytes = float(r.ru_maxrss) * (1.0 if sys.platform == "darwin" else 1024.0)
+    return (float(r.ru_utime + r.ru_stime), rss_bytes / (1024.0 * 1024.0))
+
+
 def _telemetry_conn():
     conn = sqlite3.connect(TELEMETRY_PATH)
     conn.row_factory = sqlite3.Row
@@ -9056,6 +9528,34 @@ def _telemetry_init():
                 conn.execute("ALTER TABLE asks ADD COLUMN kind TEXT")
             except Exception:
                 pass
+            try:
+                conn.execute("ALTER TABLE asks ADD COLUMN cpu_sec REAL")
+            except Exception:
+                pass
+            try:
+                conn.execute("ALTER TABLE asks ADD COLUMN cpu_pct REAL")
+            except Exception:
+                pass
+            try:
+                conn.execute("ALTER TABLE asks ADD COLUMN rss_mb REAL")
+            except Exception:
+                pass
+            try:
+                conn.execute("ALTER TABLE asks ADD COLUMN lean INTEGER DEFAULT 0")
+            except Exception:
+                pass
+            try:
+                conn.execute("ALTER TABLE asks ADD COLUMN helper_calls INTEGER DEFAULT 0")
+            except Exception:
+                pass
+            try:
+                conn.execute("ALTER TABLE asks ADD COLUMN helper_sec REAL DEFAULT 0")
+            except Exception:
+                pass
+            try:
+                conn.execute("ALTER TABLE asks ADD COLUMN ans_path TEXT")
+            except Exception:
+                pass
         conn.close()
     except Exception:
         pass
@@ -9074,6 +9574,13 @@ def _telemetry_log_ask(row):
         row["tokens_out"] = int(row.get("tokens_out") or 0)
         row["cost_usd"] = float(row.get("cost_usd") or 0.0)
         row["route_reason"] = str(row.get("route_reason") or "")
+        row["cpu_sec"] = row.get("cpu_sec")
+        row["cpu_pct"] = row.get("cpu_pct")
+        row["rss_mb"] = row.get("rss_mb")
+        row["lean"] = int(row.get("lean") or 0)
+        row["helper_calls"] = int(row.get("helper_calls") or 0)
+        row["helper_sec"] = float(row.get("helper_sec") or 0.0)
+        row["ans_path"] = str(_LAST_PATH.get("v") or "")
         conn = _telemetry_conn()
         with conn:
             conn.execute(
@@ -9081,12 +9588,14 @@ def _telemetry_log_ask(row):
                    strategy, docs_count, t_open, t_route, t_passages, t_answer,
                    status, fast_retry, ungrounded, answer_len, truncated,
                    served_local, reasoning_len, t_thinking, t_content,
-                   tokens_in, tokens_out, cost_usd, route_reason, kind)
+                   tokens_in, tokens_out, cost_usd, route_reason, kind,
+                   cpu_sec, cpu_pct, rss_mb, lean, helper_calls, helper_sec, ans_path)
                    VALUES (:ts,:conv_id,:question,:mode,:model,:voice,:thinking,
                    :strategy,:docs_count,:t_open,:t_route,:t_passages,:t_answer,
                    :status,:fast_retry,:ungrounded,:answer_len,:truncated,
                    :served_local,:reasoning_len,:t_thinking,:t_content,
-                   :tokens_in,:tokens_out,:cost_usd,:route_reason,:kind)""",
+                   :tokens_in,:tokens_out,:cost_usd,:route_reason,:kind,
+                   :cpu_sec,:cpu_pct,:rss_mb,:lean,:helper_calls,:helper_sec,:ans_path)""",
                 row,
             )
             ask_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -9165,7 +9674,7 @@ def _match_citations(answer, passages):
 
 
 def _flush_ask_telemetry(
-    self, question, mode, settings, strategy, used_model, answer, passages,
+    self, question, settings, strategy, used_model, answer, passages,
     status, fast_retry=0, ungrounded=0, docs_count=0, entry=None, truncated=0,
     served_model="", reasoning_len=0, t_thinking=None, t_content=None,
     tokens_in=0, tokens_out=0, cost_usd=0.0, route_reason="", kind=""
@@ -9178,11 +9687,19 @@ def _flush_ask_telemetry(
         for name, t in getattr(self, "_trace", []):
             if name.startswith("passages"):
                 trace["passages"] = t
+        wall = max((t for _, t in getattr(self, "_trace", [])), default=0.0) or 0.0
+        cpu_sec = cpu_pct = rss_mb = None
+        usage0 = getattr(self, "_usage0", None)
+        if usage0 is not None:
+            cpu1, rss1 = _proc_usage()
+            cpu_sec = round(cpu1 - usage0[0], 3)
+            cpu_pct = round((cpu1 - usage0[0]) / wall * 100.0, 1) if wall > 0 else None
+            rss_mb = round(rss1, 1)
         row = {
             "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
             "conv_id": (entry or {}).get("conv", "") or (_current_conv_id() or ""),
             "question": question,
-            "mode": mode,
+            "mode": "",
             "model": (served_model or used_model or ""),
             "voice": (settings or {}).get("voice", "default"),
             "thinking": str((settings or {}).get("thinking", "")),
@@ -9206,6 +9723,12 @@ def _flush_ask_telemetry(
             "cost_usd": float(cost_usd or 0.0),
             "route_reason": str(route_reason or _ROUTE_REASON or ""),
             "kind": str(kind or ""),
+            "cpu_sec": cpu_sec,
+            "cpu_pct": cpu_pct,
+            "rss_mb": rss_mb,
+            "lean": 1 if _lean() else 0,
+            "helper_calls": int(_HELPER_STATS.get("calls") or 0),
+            "helper_sec": round(float(_HELPER_STATS.get("sec") or 0.0), 2),
         }
         ask_id = _telemetry_log_ask(row)
         if ask_id:
@@ -9260,7 +9783,6 @@ async def _backfill_summaries(limit=20):
 
 class Brain:
     def __init__(self):
-        self._rag = None
         self._lock = asyncio.Lock()
         self._last_stream_result = None
         self._convo_summary = ""
@@ -9292,12 +9814,22 @@ class Brain:
                 for e in older
             )
             try:
-                summary = await _fast_llm(
-                    "Compress this conversation into 3-4 sentences, keeping the "
-                    "key topics, open questions, and anything the user cares about.\n\n"
-                    + text
-                )
-                self._convo_summary = (summary or "").strip()
+                if _offline():
+                    # Offline, summarising older turns with the local model costs a
+                    # full model round-trip; the questions alone carry the topics.
+                    qs = [str(e.get("question") or "").strip() for e in older]
+                    qs = [q for q in qs if q]
+                    self._convo_summary = (
+                        "Earlier questions in this conversation: "
+                        + " | ".join(qs[-12:])
+                    )[:1200]
+                else:
+                    summary = await _fast_llm(
+                        "Compress this conversation into 3-4 sentences, keeping the "
+                        "key topics, open questions, and anything the user cares about.\n\n"
+                        + text
+                    )
+                    self._convo_summary = (summary or "").strip()
             except Exception:
                 self._convo_summary = ""
             self._convo_summary_key = key
@@ -9316,10 +9848,6 @@ class Brain:
             msgs.append({"role": "user", "content": entry.get("question", "")})
             msgs.append({"role": "assistant", "content": str(entry.get("answer", ""))[:3000]})
         return msgs
-
-    async def open(self):
-        """No-op compatibility: the brain no longer needs a framework instance."""
-        return None
 
     async def close(self):
         pass
@@ -9363,8 +9891,8 @@ class Brain:
             removed = [rel for rel in removed if rel.startswith(only)]
         return new_files, changed_files, removed, current
 
-    async def _insert_document(self, rag, path, rel):
-        """Own ingestion: stage -> chunk -> embed -> insert (no LightRAG)."""
+    async def _insert_document(self, path, rel):
+        """Ingestion: stage -> chunk -> embed -> insert."""
         docs = _staged_texts(path)
         if docs is None:
             docs = _stage_file(path)
@@ -9493,7 +10021,6 @@ class Brain:
             }
 
         manifest = _load_manifest()
-        rag = await self.open()
 
         new_files, changed_files, removed, current = self._scan_changes(only=only)
 
@@ -9522,7 +10049,7 @@ class Brain:
                 try:
                     for doc_id in (_entry_docs(manifest.get(rel)) or [_doc_id(rel)]):
                         await self._delete_chunks_by_doc(doc_id)
-                    doc_ids = await self._insert_document(rag, path, rel)
+                    doc_ids = await self._insert_document(path, rel)
                     manifest[rel] = {"hash": current[rel], "docs": doc_ids}
                     stats["updated"] += 1
                     if prog:
@@ -9537,7 +10064,7 @@ class Brain:
             for path in new_files:
                 rel = str(path.relative_to(KNOWLEDGE_ROOT))
                 try:
-                    doc_ids = await self._insert_document(rag, path, rel)
+                    doc_ids = await self._insert_document(path, rel)
                     manifest[rel] = {"hash": current[rel], "docs": doc_ids}
                     stats["indexed"] += 1
                     if prog:
@@ -9569,7 +10096,7 @@ class Brain:
         canary = []
         for rel in processed:
             try:
-                for name, ok, detail in await _canary_check(rag, rel):
+                for name, ok, detail in await _canary_check(rel):
                     if not ok:
                         canary.append(f"{rel}: {name} — {detail}")
             except Exception as exc:
@@ -9590,13 +10117,12 @@ class Brain:
             strategy = "expand"  # mirror the answer path: every question is grounded
         if _has_universal_intent(question):
             strategy = "universal"
-        rag = await self.open()
         terms = _derive_terms(question)
         named = _named_sources(question)
         passages = []
         if strategy != "simple":
             try:
-                passages = await _probe_passages(rag, question)
+                passages = await _probe_passages(question)
             except Exception:
                 pass
         route = await _route_model(question)
@@ -9631,7 +10157,6 @@ class Brain:
 
         t0 = _time.time()
         results = []
-        rag = await self.open()
         try:
             chunks = _load_chunk_texts()
             _fts_sync()
@@ -9644,7 +10169,7 @@ class Brain:
             manifest = _load_manifest()
             for rel in sorted(manifest):
                 try:
-                    for name, ok, detail in await _canary_check(rag, rel):
+                    for name, ok, detail in await _canary_check(rel):
                         label = f"{rel.split('/')[-1][:30]} :: {name}"
                         results.append((label, ok, detail))
                 except Exception as exc:
@@ -9653,7 +10178,7 @@ class Brain:
             results.append(("elapsed", True, f"{_time.time() - t0:.1f}s"))
         return results
 
-    async def ask(self, question, mode=None, lazy=True):
+    async def ask(self, question, lazy=True):
         if not _store_ok():
             return {
                 "status": "store_stale",
@@ -9668,9 +10193,12 @@ class Brain:
                 "contexts": [],
             }
         settings = _load_settings()
-        mode = mode or settings["mode"]
         _t0ask = time.time()
         self._trace = []
+        self._usage0 = _proc_usage()
+        _HELPER_STATS["calls"] = 0
+        _HELPER_STATS["sec"] = 0.0
+        _LAST_CENSUS.clear()
 
         def _t(name):
             self._trace.append((name, round(time.time() - _t0ask, 2)))
@@ -9710,7 +10238,6 @@ class Brain:
                         ),
                     }
 
-        rag = await self.open()
         _t("open")
 
         conversation_history = await self._build_conversation_history()
@@ -9719,7 +10246,7 @@ class Brain:
         score = _question_heuristic_score(question)
         interpretive = _is_interpretive(question, score)
 
-        sys_template = _rag_system_prompt(mode, interpretive=interpretive)
+        sys_template = _rag_system_prompt(interpretive=interpretive)
         if lens:
             lens_block = lens.replace("{", "{{").replace("}", "}}") + "\n\n"
             sys_template = lens_block + sys_template
@@ -9729,7 +10256,8 @@ class Brain:
         # Comprehension FIRST: the strategy choice below wants the classifier's
         # kind (compare/research -> universal evidence), not just keywords.
         try:
-            await _expand_query(question)
+            if _plan_needed(question, _heuristic_kind(question)) or _is_hard_question(question):
+                await _expand_query(question)
         except Exception:
             pass
         strategy = _retrieval_strategy(question, score)
@@ -9741,9 +10269,11 @@ class Brain:
             or an_kind in ("compare", "research", "argument", "synthesis", "universal")
         ):
             strategy = "universal"
+        ans_path = _answer_path(question, strategy, _question_kind(question))
+        _LAST_PATH["v"] = ans_path
         passages = []
         try:
-            passages = await _build_passages(rag, question, strategy)
+            passages = await _build_passages(question, strategy)
         except Exception as exc:
             _telemetry_log_feedback(
                 "retrieval_error", str(exc)[:160], _current_conv_id()
@@ -9766,6 +10296,7 @@ class Brain:
                 passages,
                 full=_has_quote_intent(question)
                 or strategy in ("universal", "hunt"),
+                max_chars=(7000 if ans_path == "fast" else None),
             )
             if block:
                 sys_template = sys_template + block
@@ -9847,6 +10378,16 @@ class Brain:
         retried = False
         ungrounded_n = 0
         _t("passages")
+        det_answer = ""
+        if (
+            _det_enabled()
+            and census_block
+            and _question_kind(question) == "count"
+        ):
+            try:
+                det_answer = _thufir_census_answer()
+            except Exception:
+                det_answer = ""
         try:
             an_kind = str(_analysis(question).get("kind") or "").lower()
             _ROUTE_OVERRIDE = await _route_model(
@@ -9857,23 +10398,18 @@ class Brain:
                     or bool(census_block)
                 ),
             )
-            answer = await query_llm(
-                question,
-                system_prompt=sys_template,
-                history_messages=conversation_history,
-                **(
-                    {
-                        "think": _question_kind(question)
-                        in (
-                            "compare", "research", "argument", "synthesis",
-                            "concept", "commentary",
-                        )
-                    }
-                    if _offline()
-                    else {}
-                ),
-            )
-            usage_snapshot = dict(_LAST_USAGE or {})
+            if det_answer:
+                # Thufir: the count was computed deterministically; skip the writer.
+                answer = det_answer
+                usage_snapshot = {}
+            else:
+                answer = await query_llm(
+                    question,
+                    system_prompt=sys_template,
+                    history_messages=conversation_history,
+                    **(_offline_gen_kwargs(question) if _offline() else {}),
+                )
+                usage_snapshot = dict(_LAST_USAGE or {})
 
             if not (answer and str(answer).strip()):
                 r_first = (_LAST_REASONING or "").strip()
@@ -9902,7 +10438,31 @@ class Brain:
                         )
                     else:
                         answer = _no_answer_line()
-            served_model = _LAST_SERVED_MODEL
+            # Clean-stop: if the output cap clipped a non-Thufir answer
+            # mid-sentence, continue it once so detail is never lost to budget.
+            if (
+                _offline()
+                and not det_answer
+                and answer
+                and str(answer).strip()
+                and _looks_truncated(answer)
+            ):
+                try:
+                    cap = int(_offline_gen_kwargs(question).get("max_tokens") or 0)
+                    done = int((usage_snapshot or {}).get("completion_tokens", 0) or 0)
+                    if cap and done >= cap - 8:
+                        cont = await query_llm(
+                            "Continue this answer EXACTLY where it stopped; no "
+                            "repetition, no preamble:\n" + str(answer)[-900:],
+                            system_prompt="You continue an answer seamlessly.",
+                            think=False,
+                            max_tokens=400,
+                        )
+                        if cont and str(cont).strip():
+                            answer = str(answer).rstrip() + " " + str(cont).lstrip()
+                except Exception:
+                    pass
+            served_model = "thufir" if det_answer else _LAST_SERVED_MODEL
             if passages and settings.get("filter_references", True):
                 try:
                     answer = _rewrite_references(answer, passages)
@@ -10001,13 +10561,16 @@ class Brain:
         entry = {
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "question": question,
-            "mode": mode,
+            "mode": "",
             "answer": answer,
             "contexts": context_text,
         }
         _append_history(entry)
         try:
-            summary = await _summarize_question(question)
+            # Offline, the LLM summary costs a 21 GB helper round-trip for a mere
+            # sidebar title. Derive it deterministically instead (same fallback
+            # the store already uses); online, keep the model summary.
+            summary = _short_summary(question) if _offline() else await _summarize_question(question)
             if summary:
                 _update_history_summary(entry.get("conv"), entry["timestamp"], question, summary)
         except Exception:
@@ -10017,7 +10580,7 @@ class Brain:
         _tok_out = int((usage_snapshot or {}).get("completion_tokens", 0) or 0)
         _model_used = served_model or (_ROUTE_OVERRIDE or settings.get("model") or "")
         _flush_ask_telemetry(
-            self, question, mode, settings, strategy,
+            self, question, settings, strategy,
             (_ROUTE_OVERRIDE or settings.get("model") or ""), answer,
             passages, "answered" if str(answer).strip() else "no_answer",
             fast_retry=retried, ungrounded=ungrounded_n,
@@ -10029,7 +10592,7 @@ class Brain:
         )
         return entry
 
-    async def ask_stream(self, question, mode=None):
+    async def ask_stream(self, question):
         """Answer grounded in the library, streaming tokens via an async generator.
 
         Yields the accumulated answer text; after completion, the final result is
@@ -10059,14 +10622,16 @@ class Brain:
         self._last_stream_result = None
         _t0 = time.time()
         self._trace = []
+        self._usage0 = _proc_usage()
+        _HELPER_STATS["calls"] = 0
+        _HELPER_STATS["sec"] = 0.0
+        _LAST_CENSUS.clear()
 
         def _t(name):
             self._trace.append((name, round(time.time() - _t0, 2)))
 
         settings = _load_settings()
-        mode = mode or settings["mode"]
         _ensure_conv()
-        rag = await self.open()
         _t("open")
 
         conversation_history = await self._build_conversation_history()
@@ -10075,7 +10640,7 @@ class Brain:
         lens = (settings.get("lens") or "").strip()
         score = _question_heuristic_score(question)
         interpretive = _is_interpretive(question, score)
-        sys_template = _rag_system_prompt(mode, interpretive=interpretive)
+        sys_template = _rag_system_prompt(interpretive=interpretive)
         if lens:
             lens_block = lens.replace("{", "{{").replace("}", "}}") + "\n\n"
             sys_template = lens_block + sys_template
@@ -10086,7 +10651,8 @@ class Brain:
         # universal evidence, count -> census, quotes -> long windows) must
         # drive the strategy and prompt choices, not only routing.
         try:
-            await _expand_query(question)
+            if _plan_needed(question, _heuristic_kind(question)) or _is_hard_question(question):
+                await _expand_query(question)
         except Exception:
             pass
         strategy = _retrieval_strategy(question, score)
@@ -10098,6 +10664,8 @@ class Brain:
             or an_kind in ("compare", "research", "argument", "synthesis", "universal")
         ):
             strategy = "universal"
+        ans_path = _answer_path(question, strategy, _question_kind(question))
+        _LAST_PATH["v"] = ans_path
         passages = []
         progress = getattr(self, "_progress", None)
 
@@ -10112,7 +10680,7 @@ class Brain:
         _set_retrieval_note(_note)
         census_block = ""
         try:
-            passages = await _build_passages(rag, question, strategy)
+            passages = await _build_passages(question, strategy)
         except Exception as exc:
             _telemetry_log_feedback(
                 "retrieval_error", str(exc)[:160], _current_conv_id()
@@ -10135,6 +10703,7 @@ class Brain:
                 passages,
                 full=_has_quote_intent(question)
                 or strategy in ("universal", "hunt"),
+                max_chars=(7000 if ans_path == "fast" else None),
             )
             if block:
                 sys_template = sys_template + block
@@ -10226,6 +10795,12 @@ class Brain:
         retried = False
         used_fallback = False
         ungrounded_n = 0
+        det_answer = ""
+        if _det_enabled() and census_block and _question_kind(question) == "count":
+            try:
+                det_answer = _thufir_census_answer()
+            except Exception:
+                det_answer = ""
         try:
             an_kind = str(_analysis(question).get("kind") or "").lower()
             _ROUTE_OVERRIDE = await _route_model(
@@ -10259,32 +10834,38 @@ class Brain:
 
             _set_reasoning_hook(_hook)
             parts = []
-            try:
-                stream_gen = await query_llm(
-                    question,
-                    system_prompt=sys_template,
-                    history_messages=conversation_history,
-                    stream=True,
-                **(
-                    _offline_gen_kwargs(question)
-                    if _offline()
-                    else {}
-                ),
-                )
-                async for chunk in stream_gen:
-                    if chunk:
-                        if content_start is None:
-                            content_start = time.time()
-                        content_end = time.time()
-                        parts.append(chunk)
-                        yield "".join(parts)
-            except Exception as exc:
-                # The stream died mid-flight: fall through to the retry path
-                # below (a non-stream call to the fast model, which can itself
-                # fall back to local) instead of erroring out.
-                _telemetry_log_feedback(
-                    "fallback", f"stream: {str(exc)[:160]}", _current_conv_id()
-                )
+            if det_answer:
+                # Thufir: deterministic count, emitted whole; no writer call.
+                used_model = "thufir"
+                parts.append(det_answer)
+                yield det_answer
+            else:
+                try:
+                    stream_gen = await query_llm(
+                        question,
+                        system_prompt=sys_template,
+                        history_messages=conversation_history,
+                        stream=True,
+                    **(
+                        _offline_gen_kwargs(question)
+                        if _offline()
+                        else {}
+                    ),
+                    )
+                    async for chunk in stream_gen:
+                        if chunk:
+                            if content_start is None:
+                                content_start = time.time()
+                            content_end = time.time()
+                            parts.append(chunk)
+                            yield "".join(parts)
+                except Exception as exc:
+                    # The stream died mid-flight: fall through to the retry path
+                    # below (a non-stream call to the fast model, which can itself
+                    # fall back to local) instead of erroring out.
+                    _telemetry_log_feedback(
+                        "fallback", f"stream: {str(exc)[:160]}", _current_conv_id()
+                    )
             full = "".join(parts)
             usage_snapshot = dict(_LAST_USAGE or {})
             _set_reasoning_hook(None)
@@ -10456,14 +11037,14 @@ class Brain:
             entry = {
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "question": question,
-                "mode": mode,
+                "mode": "",
                 "answer": answer,
                 "contexts": contexts,
                 "model": used_model,
             }
             _append_history(entry)
             try:
-                summary = await _summarize_question(question)
+                summary = _short_summary(question) if _offline() else await _summarize_question(question)
                 if summary:
                     entry["summary"] = summary
                     _update_history_summary(entry.get("conv"), entry["timestamp"], question, summary)
@@ -10497,7 +11078,7 @@ class Brain:
                 "kind": _question_kind(question),
             }
             _flush_ask_telemetry(
-                self, question, mode, settings, strategy, used_model, answer,
+                self, question, settings, strategy, used_model, answer,
                 passages,
                 "no_answer" if used_fallback else ("answered" if answer.strip() else "no_answer"),
                 fast_retry=retried, ungrounded=ungrounded_n,
@@ -10875,7 +11456,6 @@ class Brain:
             "embed_model": OLLAMA_EMBED_MODEL,
             "thinking": settings["thinking"],
             "history_turns": settings["history_turns"],
-            "mode": settings["mode"],
             "routing": settings.get("routing", "hybrid"),
             "offline": bool(settings.get("offline", False)),
             "temperature": settings["temperature"],

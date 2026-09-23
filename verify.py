@@ -781,7 +781,7 @@ def check_register_retrieval():
     """The Kull-wahad wound: a concept question must reach the glossary."""
     try:
         hits = asyncio.run(
-            bc._librarian_search(None, "what does Kull wahad mean", k=8)
+            bc._librarian_search("what does Kull wahad mean", k=8)
         )
     except Exception as exc:
         return True, f"skipped (retrieval unavailable: {type(exc).__name__})"
@@ -855,7 +855,7 @@ def check_offline_readiness():
         bad.append("per-call think override missing")
     if "_offline_gen_kwargs" not in core or '"think": kind' not in core:
         bad.append("think-routing not keyed to the register classifier")
-    if "local_model=OLLAMA_DEEP_MODEL,\n        think=False" not in core:
+    if "local_model=OLLAMA_FAST_MODEL,\n        think=False" not in core:
         bad.append("offline librarian still thinks (slow)")
     if 'strategy in ("universal", "hunt") and not _offline()' in core:
         bad.append("offline still truncates full passage rendering")
@@ -875,6 +875,30 @@ def check_offline_readiness():
     if "qwen" not in bc.resolve_model("qwen-deep"):
         bad.append("offline librarian alias broken")
     return (not bad), ("; ".join(bad) if bad else "offline contract OK (32k, think-routing, few-shot)")
+
+
+def check_passage_resolution():
+    """Known-hard citation labels must resolve (regression guard for A6)."""
+    cases = [
+        ("*Dune*", "Chapter 36"),
+        ("Kojeve", "Introduction to the Reading of Hegel"),
+        ("Dune", "Ch. 24"),
+        ("God Emperor", "Chapter 8"),
+        ("Muqaddimah", "Chapter 6"),
+    ]
+    bad = []
+    for book, loc in cases:
+        try:
+            r = bc._passage_source(book, loc, "")
+        except Exception as exc:
+            bad.append(f"{book}: {type(exc).__name__}")
+            continue
+        if not r or not (r.get("text") or ""):
+            bad.append(f"{book} · {loc} unresolved")
+    return (
+        not bad,
+        "; ".join(bad) if bad else f"citation aliases resolve ({len(cases)}/{len(cases)})",
+    )
 
 
 def check_pdf_anchors():
@@ -1058,6 +1082,7 @@ def build_checks(quick=False):
         ("ui.gates", check_ui_and_gates),
         ("offline.contract", check_offline_readiness),
         ("citations.anchors", check_pdf_anchors),
+        ("citations.resolve", check_passage_resolution),
         ("voices.grammar", check_voice_presets),
         ("book.mode", check_book_mode),
     ]

@@ -99,11 +99,6 @@ import SwiftUI
     var bgTintRight: Color = Color.white.opacity(0.14)
     var bgRegionAvg: [NSColor] = []  // [left, center, right]
     var bgTopColor: NSColor = NSColor(white: 0.5, alpha: 1)
-    /// The artwork-derived colour palette for the current background — the
-    /// global authority every UI colour is resolved through.
-    var bgPalette: BackgroundPalette = .placeholder
-    var paletteShift: Double = 0
-    var paletteStyle: PaletteStyle = .complementary
     /// The OKLCH colour system: the image reduced to perceptual colour, the
     /// user's controls, and the resulting contrast-enforced theme.
     var imagePalette: ImagePalette = .neutral
@@ -117,14 +112,6 @@ import SwiftUI
     /// Tinted (colour-forward) or clear (clarity-forward) Liquid Glass.
     var glassStyle: GlassStyle =
         GlassStyle(rawValue: UserDefaults.standard.string(forKey: "glassStyle") ?? "") ?? .tinted
-    /// When on, the live UI draws from the OKLCH theme instead of the legacy HSB
-    /// palette paths. On by default now (the OKLCH look); an explicit off in
-    /// prefs reverts to the classic HSB path.
-    var useOKLCHTheme: Bool = {
-        let d = UserDefaults.standard
-        if d.object(forKey: "useOKLCHTheme") == nil { return true }
-        return d.bool(forKey: "useOKLCHTheme")
-    }()
     /// Normalized y (top-origin) of the calmest band in the photo, so the art
     /// can be panned to sit its least-contrasty region behind the wordmark.
     var bgQuietY: CGFloat = 0.4
@@ -143,21 +130,11 @@ import SwiftUI
     private var lastRegionSize: CGSize = .zero
 
     func isLight(_ r: BgRegion) -> Bool {
-        if useOKLCHTheme { return colorTheme.isLight }
-        switch r {
-        case .left: return bgLightLeft
-        case .center: return bgLightCenter
-        case .right: return bgLightRight
-        }
+        colorTheme.isLight
     }
     /// Complementary, low-saturation tint drawn from the colour behind a region.
     func tint(_ r: BgRegion) -> Color {
-        if useOKLCHTheme { return colorTheme.surfaceTint }
-        switch r {
-        case .left: return bgTintLeft
-        case .center: return bgTintCenter
-        case .right: return bgTintRight
-        }
+        colorTheme.surfaceTint
     }
 
     /// Representative colour of the whole artwork (mean of the sampled regions),
@@ -192,32 +169,12 @@ import SwiftUI
     /// of its *contrasting* temperature, so the type reads as a considered colour
     /// rather than flat grey — but at ≤0.10 saturation, so contrast never suffers.
     func textColors(_ r: BgRegion) -> (primary: Color, secondary: Color) {
-        if useOKLCHTheme {
-            switch inkMode {
-            case .theme:
-                return (colorTheme.ink, colorTheme.inkDim)
-            case .background:
-                return adaptiveInk(r)
-            }
+        switch inkMode {
+        case .theme:
+            return (colorTheme.ink, colorTheme.inkDim)
+        case .background:
+            return adaptiveInk(r)
         }
-        let key = regionKey(r)
-        if let hit = textColorCache[key] { return hit }
-        let ns = regionColor(r)
-        let lum = ColorTheory.luminance(ns)
-        let t0 = min(1, max(0, (lum - 0.44) / 0.12))
-        let t = t0 * t0 * (3 - 2 * t0)
-        let value = 1.00 * (1 - t) + 0.03 * t
-        // Value comes from the *region's* luminance (contrast); the hue comes from
-        // the global palette ink, so one tool owns the type colour.
-        let (_, rs, _) = ColorTheory.hsb(ns)
-        let (ph, ps, _) = ColorTheory.hsb(bgPalette.ns(.ink))
-        let placeholder = bgPalette == .placeholder
-        let hue = placeholder ? ColorTheory.contrastingHue(ns) : ph
-        let sat = placeholder ? min(0.10, rs * 0.20) : ps
-        let primary = Color(hue: hue, saturation: sat, brightness: value)
-        let result = (primary, primary.opacity(0.78))
-        textColorCache[key] = result
-        return result
     }
 
     /// Region-adaptive ink: pick light/dark from the photo behind the region and
@@ -258,19 +215,7 @@ import SwiftUI
     /// is genuinely colourful does it take on a bright *analogous* hue — one that
     /// stays in the art's own warm/cool family — never a muddy mid-tone.
     func titleColor(_ r: BgRegion = .center) -> Color {
-        if useOKLCHTheme {
-            return inkMode == .theme ? colorTheme.ink : adaptiveInk(r).0
-        }
-        let ns = regionColor(r)
-        let lum = ColorTheory.luminance(ns)
-        let (_, s, _) = ColorTheory.hsb(ns)
-        let colorful = s > 0.18
-        let (ph, ps, _) = ColorTheory.hsb(bgPalette.ns(.analogous))
-        let placeholder = bgPalette == .placeholder
-        let hue = placeholder ? ColorTheory.adjacentHue(ns) : ph
-        let sat = colorful ? min(0.62, max(s * 1.1, placeholder ? 0 : ps)) : 0.0
-        let value: CGFloat = lum < 0.5 ? 0.99 : 0.05  // light on dark, dark on light
-        return Color(hue: hue, saturation: sat, brightness: value)
+        inkMode == .theme ? colorTheme.ink : adaptiveInk(r).0
     }
 
     /// The region's colour temperature (warm/cool/neutral) — the hue axis that
@@ -286,31 +231,13 @@ import SwiftUI
     /// art's contrasting temperature), so controls pop against a warm photo with
     /// cool accents and vice-versa. Falls back to the brand spice for greyscale.
     func accentColor(_ r: BgRegion = .left) -> Color {
-        if useOKLCHTheme { return colorTheme.accent }
-        if bgPalette != .placeholder, !bgPalette.isNeutral { return bgPalette.accent }
-        let ns = regionColor(r)
-        let (_, s, _) = ColorTheory.hsb(ns)
-        guard ColorTheory.temperature(ns) != .neutral, s > 0.12 else { return Palette.day.spice }
-        return Color(
-            hue: ColorTheory.contrastingHue(ns),
-            saturation: min(0.72, max(0.42, s)),
-            brightness: 0.86)
+        colorTheme.accent
     }
 
     /// Title colour for the top band (the wordmark once it rises to R1): plain
     /// high-contrast black or white, with an analogous hue when colourful.
     func topTitleColor() -> Color {
-        if useOKLCHTheme {
-            return inkMode == .theme ? colorTheme.ink : topInk(dim: false)
-        }
-        let ns = bgTopColor
-        let lum = ColorTheory.luminance(ns)
-        let (_, s, _) = ColorTheory.hsb(ns)
-        let colorful = s > 0.18
-        let hue = ColorTheory.adjacentHue(ns)
-        let sat = colorful ? min(0.62, s * 1.1) : 0.0
-        let value: CGFloat = lum < 0.5 ? 0.99 : 0.05
-        return Color(hue: hue, saturation: sat, brightness: value)
+        inkMode == .theme ? colorTheme.ink : topInk(dim: false)
     }
 
     func text(_ r: BgRegion) -> Color { textColors(r).primary }
@@ -337,18 +264,10 @@ import SwiftUI
 
     /// High-contrast foreground for the top area (empty state / chrome).
     func topText() -> Color {
-        if useOKLCHTheme {
-            return inkMode == .theme ? colorTheme.ink : topInk(dim: false)
-        }
-        return BackgroundAnalysis.luminance(bgTopColor) < 0.5
-            ? Color(white: 1.0) : Color(white: 0.03)
+        inkMode == .theme ? colorTheme.ink : topInk(dim: false)
     }
     func topTextDim() -> Color {
-        if useOKLCHTheme {
-            return inkMode == .theme ? colorTheme.inkDim : topInk(dim: true)
-        }
-        return BackgroundAnalysis.luminance(bgTopColor) < 0.5
-            ? Color(white: 0.78) : Color(white: 0.28)
+        inkMode == .theme ? colorTheme.inkDim : topInk(dim: true)
     }
 
     /// Comfortable reading measure: the width of `chars` average characters
@@ -378,16 +297,7 @@ import SwiftUI
     func scrimOpacity(_ r: BgRegion) -> Double {
         // Stained glass: one consistent plate from the theme, so the material
         // reads as a single surface rather than varying per photo region.
-        if useOKLCHTheme { return colorTheme.isLight ? 0.42 : 0.58 }
-        let key = regionKey(r)
-        if let hit = scrimCache[key] { return hit }
-        let ns = regionColor(r).usingColorSpace(.deviceRGB) ?? NSColor(white: 0.5, alpha: 1)
-        let lum = 0.2126 * ns.redComponent + 0.7152 * ns.greenComponent + 0.0722 * ns.blueComponent
-        let midness = 1 - min(1, abs(lum - 0.5) * 2)
-        // solid floor guarantees legibility; extra where the photo is mid-toned
-        let value = 0.26 + 0.46 * Double(midness)
-        scrimCache[key] = value
-        return value
+        colorTheme.isLight ? 0.42 : 0.58
     }
 
     /// Colour math hit by every row render; cached per region and invalidated
@@ -871,7 +781,6 @@ import SwiftUI
             ?? .fallback
         guard let img = BackgroundAnalysis.thumb(name, max: 512) else { return }
         bgImageSize = img.size
-        rebuildPalette(for: name, image: img)
         rebuildColorTheme(for: name, image: img)
         lastRegionSize = .zero
         // The quiet-band scan (36 samples) and the region read run off-main;
@@ -928,39 +837,6 @@ import SwiftUI
         bgTintRight = BackgroundAnalysis.complementaryTint(from: rAvg, isLight: bgLightRight)
         bgIsLight = bgLightCenter
         bgTint = bgTintCenter
-    }
-
-    /// Build the artwork palette for `name` at the current global shift and
-    /// palette style. The image analysis (clusters + hue/brightness) is cached
-    /// to disk per image, so styles can be re-derived instantly.
-    func rebuildPalette(for name: String, image: NSImage? = nil) {
-        // When the OKLCH theme is live the legacy HSB palette is never consulted,
-        // so skip the extraction entirely.
-        if useOKLCHTheme {
-            bgPalette = .placeholder
-            return
-        }
-        paletteShift = UserDefaults.standard.double(forKey: "paletteShift")
-        paletteStyle =
-            PaletteStyle(rawValue: UserDefaults.standard.string(forKey: "paletteStyle") ?? "")
-            ?? .complementary
-        guard !name.isEmpty else {
-            bgPalette = .placeholder
-            return
-        }
-        if let a = analysis(for: name, image: image) {
-            let theme =
-                AppTheme(rawValue: UserDefaults.standard.string(forKey: "appearance") ?? "")
-                ?? .fallback
-            let mono = theme == .mono
-            let dark = mono || !a.isLight
-            bgPalette = PaletteExtractor.palette(
-                from: a, style: paletteStyle, dark: dark, monochrome: mono
-            )
-            .rotated(by: paletteShift)
-        } else {
-            bgPalette = .placeholder
-        }
     }
 
     /// Build the OKLCH theme for `name`. The pixel sample is taken on the main
@@ -1077,14 +953,6 @@ import SwiftUI
         return ColorResolver.theme(for: imagePalette, controls: c)
     }
 
-    /// Turn the OKLCH theme on/off for the live UI (reversible).
-    func setUseOKLCHTheme(_ on: Bool) {
-        useOKLCHTheme = on
-        UserDefaults.standard.set(on, forKey: "useOKLCHTheme")
-        if on, colorTheme == .placeholder { rebuildColorTheme(for: backgroundName) }
-        invalidateColorCaches()
-    }
-
     /// Choose whether text ink matches the theme or adapts to the background.
     func setInkMode(_ m: InkMode) {
         inkMode = m
@@ -1098,47 +966,6 @@ import SwiftUI
         UserDefaults.standard.set(s.rawValue, forKey: "glassStyle")
     }
 
-    /// The palette's colours arranged by *dominance* in the image: a role lands
-    /// next to the heaviest cluster it resembles, so the biggest areas of the
-    /// photo come first and the neutrals (ink/surface) fall to the end.
-    func paletteSwatches(for style: PaletteStyle) -> [Color] {
-        let pal = previewPalette(for: style)
-        let clusters = storedAnalyses[backgroundName]?.clusters ?? []
-        func dominance(_ c: Color) -> Double {
-            let ns = NSColor(c)
-            var best = 0.0
-            for cl in clusters where PaletteAnalyzer.distance(ns, cl.color.nsColor) < 0.30 {
-                best = max(best, cl.weight)
-            }
-            return best
-        }
-        return PaletteRole.allCases
-            .map { (color: pal.color($0), weight: dominance(pal.color($0))) }
-            .sorted { $0.weight > $1.weight }
-            .map(\.color)
-    }
-
-    /// The image's main colours, most dominant first.
-    func dominantColors(count: Int = 6) -> [Color] {
-        let clusters = (storedAnalyses[backgroundName]?.clusters ?? [])
-            .sorted { $0.weight > $1.weight }
-        let cs = clusters.prefix(count).map { $0.color.color }
-        return cs.isEmpty ? PaletteRole.allCases.map { bgPalette.color($0) } : Array(cs)
-    }
-    /// The single dominant colour (for backgrounds).
-    func mainColor() -> Color { dominantColors(count: 1).first ?? bgPalette.dominant }
-    /// The next most common colour (for conversation cards etc.).
-    func secondaryColor() -> Color {
-        let d = dominantColors(count: 3)
-        return d.count > 1 ? d[1] : (d.first ?? bgPalette.secondary)
-    }
-
-    /// A UI colour from the Material-style token set (follows the image).
-    /// `dark: true` selects the dark-scheme set for always-dark surfaces.
-    func token(_ role: TokenRole, dark: Bool = false) -> Color {
-        (dark ? bgPalette.tokensDark : bgPalette.tokens).color(role)
-    }
-
     /// The cached analysis of `name`, computing and persisting it on first use.
     func analysis(for name: String, image: NSImage? = nil) -> ImageAnalysis? {
         guard !name.isEmpty else { return nil }
@@ -1148,42 +975,6 @@ import SwiftUI
         storedAnalyses[name] = a
         PaletteStore.save(storedAnalyses)
         return a
-    }
-
-    /// Global retint: rotate every derived hue so the whole UI shifts with the
-    /// current background's palette.
-    func setPaletteShift(_ degrees: Double) {
-        UserDefaults.standard.set(degrees, forKey: "paletteShift")
-        rebuildPalette(for: backgroundName)
-    }
-
-    /// Choose how the palette is built from the image (complementary, main,
-    /// secondary, …). Independent of which image is selected.
-    func setPaletteStyle(_ style: PaletteStyle) {
-        UserDefaults.standard.set(style.rawValue, forKey: "paletteStyle")
-        paletteStyle = style
-        rebuildPalette(for: backgroundName)
-    }
-
-    /// The palette a given style would produce for the current image — used to
-    /// show a ready-made example before the user commits to it.
-    func previewPalette(for style: PaletteStyle) -> BackgroundPalette {
-        guard let a = storedAnalyses[backgroundName] else { return bgPalette }
-        let theme =
-            AppTheme(rawValue: UserDefaults.standard.string(forKey: "appearance") ?? "")
-            ?? .fallback
-        let mono = theme == .mono
-        return PaletteExtractor.palette(
-            from: a, style: style, dark: mono || !a.isLight, monochrome: mono
-        )
-        .rotated(by: paletteShift)
-    }
-
-    func shufflePaletteStyle() {
-        guard let next = PaletteStyle.allCases.filter({ $0 != paletteStyle }).randomElement() else {
-            return
-        }
-        setPaletteStyle(next)
     }
 
     private var storedAnalyses: [String: ImageAnalysis] = PaletteStore.load()

@@ -127,7 +127,6 @@ async def bench_run():
 
     bench_path = b.STORAGE_DIR / "benchmark.json"
     brain = b.Brain()
-    rag = await brain.open()
     results = {}
     try:
         b._refresh_caches()
@@ -144,11 +143,11 @@ async def bench_run():
             "triangulate Stalin Kojève and Leto II on sovereignty",
         ):
             t0 = time.time()
-            await b._probe_passages(rag, q, k=8)
+            await b._probe_passages(q, k=8)
             probe_times.append(time.time() - t0)
         results["probe_median_s"] = round(sorted(probe_times)[1], 2)
         t0 = time.time()
-        await b._librarian_search(rag, "mercy", k=5)
+        await b._librarian_search("mercy", k=5)
         results["librarian_s"] = round(time.time() - t0, 2)
         results["rss_mb"] = round(
             resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6, 1
@@ -185,10 +184,9 @@ async def gold_run():
     brain = b.Brain()
     failures = 0
     try:
-        rag = await brain.open()
         for entry in entries:
             q = entry.get("question", "")
-            ps = await b._probe_passages(rag, q, k=12)
+            ps = await b._probe_passages(q, k=12)
             score, details = _score_gold_entry(ps, entry)
             prev = entry.get("last")
             regressed = prev is not None and score < prev * 0.8
@@ -397,7 +395,7 @@ def fast_checks():
             "excerpt": quran_brace["content"][:400],
             "chunk_id": quran_brace["chunk_id"],
         }
-        tmpl = b._rag_system_prompt("naive", interpretive=True) + b._render_passage_block([p])
+        tmpl = b._rag_system_prompt(interpretive=True) + b._render_passage_block([p])
         try:
             tmpl.format(response_type="x", user_prompt="y", content_data="CTX")
             record("format: brace passages survive .format()", True, "ok")
@@ -521,7 +519,7 @@ def fast_checks():
             len(win) >= 2000 and "I must not fear" in win,
             f"{len(win)} chars",
         )
-    sys_prompt = b._rag_system_prompt("naive")
+    sys_prompt = b._rag_system_prompt()
     record(
         "prompts: length follows the question",
         "Length follows the question" in sys_prompt,
@@ -714,10 +712,9 @@ PROBE_CASES = [
 async def retrieval_checks():
     brain = b.Brain()
     try:
-        rag = await brain.open()
         for question, check, label in PROBE_CASES:
             try:
-                ps = await b._probe_passages(rag, question)
+                ps = await b._probe_passages(question)
                 ok = check(ps)
                 top = ", ".join(
                     sorted(
@@ -733,8 +730,8 @@ async def retrieval_checks():
 
         # determinism: same question twice must yield the same passages
         try:
-            a = await b._probe_passages(rag, "triangulate Stalin Kojève and Leto II on sovereignty", k=8)
-            c = await b._probe_passages(rag, "triangulate Stalin Kojève and Leto II on sovereignty", k=8)
+            a = await b._probe_passages("triangulate Stalin Kojève and Leto II on sovereignty", k=8)
+            c = await b._probe_passages("triangulate Stalin Kojève and Leto II on sovereignty", k=8)
             record(
                 "retrieval: deterministic",
                 [p.get("chunk_id") for p in a] == [p.get("chunk_id") for p in c],
@@ -756,7 +753,7 @@ async def retrieval_checks():
             else:
                 probe_q = f"what is {fname}"
             try:
-                ps = await b._probe_passages(rag, probe_q)
+                ps = await b._probe_passages(probe_q)
                 own = sum(
                     1 for p in ps
                     if fname.lower() in p.get("file_path", "").lower()
@@ -904,7 +901,6 @@ async def stress_run():
 
     print("\n=== STRESS: synthetic book ingestion roundtrip ===")
     brain = b.Brain()
-    rag = await brain.open()
     marker = "STRESSMARK-" + _uuid.uuid4().hex[:10]
     rel = "books/_stress_probe.md"
     path = b.KNOWLEDGE_ROOT / rel
@@ -919,7 +915,7 @@ async def stress_run():
         stats = await brain.index(verbose=False, only=rel)
         ok_index = stats.get("indexed") == 1 and not stats.get("errors")
         t0 = _time.time()
-        ps = await b._probe_passages(rag, f"what does {marker} say about desert reservoirs", k=8)
+        ps = await b._probe_passages(f"what does {marker} say about desert reservoirs", k=8)
         probe_s = _time.time() - t0
         own = sum(1 for p in ps if marker in (p.get("content") or ""))
         record("stress: synthetic book indexes", ok_index, json.dumps(stats))
@@ -941,7 +937,7 @@ async def stress_run():
         q = f"what is {stem}"
         t0 = _time.time()
         try:
-            ps = await b._probe_passages(rag, q, k=8)
+            ps = await b._probe_passages(q, k=8)
         except Exception as exc:
             record(f"stress book: {fname[:30]}", False, f"error {exc}")
             continue
@@ -978,10 +974,10 @@ async def stress_run():
     emb = await b.nomic_embed([q], context="query")
     t_embed = _time.time() - t0
     t0 = _time.time()
-    await b._librarian_search(rag, q, k=5, embedding=b.np.expand_dims(emb[0], 0))
+    await b._librarian_search(q, k=5, embedding=b.np.expand_dims(emb[0], 0))
     t_search = _time.time() - t0
     t0 = _time.time()
-    await b._probe_passages(rag, q, k=8)
+    await b._probe_passages(q, k=8)
     t_total = _time.time() - t0
     record(
         "stress: stage timings",

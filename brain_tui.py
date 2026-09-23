@@ -40,7 +40,6 @@ from textual.widgets import (
 from brain_core import (
     Brain,
     KNOWLEDGE_ROOT,
-    VALID_MODES,
     VALID_ROUTING,
     VALID_THINKING,
     VOICE_PRESETS,
@@ -205,8 +204,6 @@ class SettingsScreen(Screen):
             return list(VOICE_PRESETS)
         if key == "thinking":
             return list(VALID_THINKING)
-        if key == "mode":
-            return list(VALID_MODES)
         if key == "routing":
             return list(VALID_ROUTING)
         if key == "search_depth":

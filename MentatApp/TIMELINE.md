@@ -145,3 +145,38 @@ Encode the reference language as data + rules, then apply:
     losing evidence. Eval 82/86 · gold 13/13.
 
 
+### Art-direction chrome pass (whole-app)
+Reference-loud control language, then a type-scale sweep, all app-side (brain untouched).
+- **Tokens** — `DesignTokens.Chrome` (circle/circleSmall/capsule/radiusS–XL/focal/glassRim/
+  pressedScale) + `display`/`title` type sizes; `TypeScale.display/title`; `ChromeShape` accessors.
+- **Shared controls** — new `DesignSystem/Chrome.swift`: `CircleIconButton` (one glass circle for
+  every disc/glyph) and generic `GlassSegmentedControl` (glass capsule + sliding thumb).
+- **Surface pass** — menu rail → tinted glass capsule of circles (was rounded-rect +
+  `ultraThinMaterial`); Text-ink / Glass pickers and Theme pickers → `GlassSegmentedControl`
+  (were system `.segmented`); command-palette rows → hover capsules; source-reader back →
+  circle + token type; quote card on `radiusM`.
+- **Cleanup** — removed both stale `#available(macOS 26.0)` gates (we target macOS 27).
+- Gates: build clean, **31/31** tests. Revert anchor: commit `0a675cf`.
+- ⏳ remaining: broaden the type sweep (role headers/meta still use literals), composer polish,
+  and retire dormant legacy HSB.
+
+#### Increment 2 — real tint, citation columns, resilient tokens, HSB retired
+- **Real Liquid Glass tint** — `GlassSegmentedControl` rebuilt on `GlassEffectContainer` +
+  `glassEffectID` (thumb morphs) with `Glass.regular.tint(...)`; command-palette hover rows use
+  `Glass.regular.tint(accent)` (was `ultraThinMaterial` + overlay). Dead `GlassSegmented` removed.
+- **Citation pop-up** — `SourceReader` plate is no longer glass: an **inverse-luminance,
+  complementary** near-opaque surface (`ColorTheory.contrastingHue` against the art's centre
+  region) so bright art → dark plate and dark art → bright plate; passage is now `ColumnText`
+  with the pager (multi-column + `‹ ›`, quote stays the focal card). Readable over loud photos.
+- **Resilient tokens** — `DesignTokens` (and every nested group) decodes field-by-field via
+  `decodeIfPresent`-style tolerance, so a token blob that predates a new field keeps its saved
+  values instead of silently resetting to defaults.
+- **Type + composer** — remaining raw `10`/`14`pt chrome literals → `TypeScale.caption`/`.emphasis`.
+- **Legacy HSB retired** — deleted the `useOKLCHTheme` toggle and every legacy branch it guarded
+  (Engine `isLight`/`tint`/`textColors`/`titleColor`/`accentColor`/`topTitleColor`/`topText*`/
+  `scrimOpacity`, `Palette.forTheme(active:)`, MentatApp ternaries); removed `PaletteStyle`,
+  `PaletteExtractor`, `rebuildPalette`, `bgPalette` + its env, `paletteShift`/`style`/swatches/
+  preview/shuffle, and the unused `token`/`dominant*` accessors. OKLCH is now the only path; the
+  region samplers (`bgLightCenter`, `bgRegionAvg`) that power the citation plate stay.
+- Gates: build clean (only the pre-existing `sliderRow` Sendable warning), **31/31** tests.
+

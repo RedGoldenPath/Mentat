@@ -4,24 +4,62 @@ import SwiftUI
 /// Full-height source reader: a tapped citation resolved to its verbatim
 /// passage. The quote is the focal card; the wider window is readable in
 /// context. Back (or Esc, handled by the host) returns to the answer.
+///
+/// The plate is deliberately *not* glass. Over a loud photograph the accent
+/// glass tint left the prose illegible, so the plate instead takes the *inverse*
+/// luminance of the artwork behind it (bright art → dark plate, dark art → light
+/// plate) along with the art's complementary hue, near-opaque so the photo can't
+/// wash the text out. That keeps the pop-up readable on any background.
 struct SourceReader: View {
     let engine: Engine
-    @Environment(\.palette) private var pal
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    private var ink: Color {
-        engine.useOKLCHTheme ? engine.colorTheme.ink : pal.text
+    private struct Contrast {
+        let artIsLight: Bool
+        let surface: Color
+        let card: Color
+        let ink: Color
+        let dim: Color
     }
-    private var dim: Color {
-        engine.useOKLCHTheme ? engine.colorTheme.inkDim : pal.textDim
+
+    private var contrast: Contrast {
+        let artIsLight = engine.bgLightCenter
+        let hue = complementHue
+        if artIsLight {
+            // bright art behind → deep plate in the opposite temperature
+            return Contrast(
+                artIsLight: true,
+                surface: plate(hue, sat: 0.24, brightness: 0.12),
+                card: plate(hue, sat: 0.30, brightness: 0.20),
+                ink: Color(white: 0.98),
+                dim: Color(white: 0.70))
+        }
+        // dark art behind → bright plate in the opposite temperature
+        return Contrast(
+            artIsLight: false,
+            surface: plate(hue, sat: 0.16, brightness: 0.97),
+            card: plate(hue, sat: 0.22, brightness: 0.90),
+            ink: Color(white: 0.07),
+            dim: Color(white: 0.40))
     }
+
+    /// The opposite-temperature hue of the artwork behind the plate — nil for
+    /// grey art, which stays neutral so no phantom hue appears.
+    private var complementHue: CGFloat? {
+        guard engine.bgRegionAvg.count > 1 else { return nil }
+        let c = engine.bgRegionAvg[1]
+        guard ColorTheory.temperature(c) != .neutral else { return nil }
+        return ColorTheory.contrastingHue(c)
+    }
+
+    private func plate(_ hue: CGFloat?, sat: Double, brightness: Double) -> Color {
+        if let hue {
+            return Color(hue: Double(hue), saturation: sat, brightness: brightness, opacity: 0.95)
+        }
+        return Color(white: brightness, opacity: 0.95)
+    }
+
     private var accent: Color { engine.accentColor(.center) }
-    private var quoteSurface: Color {
-        engine.useOKLCHTheme ? engine.colorTheme.surface : pal.bg2
-    }
-    private var quoteInk: Color {
-        engine.useOKLCHTheme ? engine.colorTheme.ink : pal.text
-    }
 
     var body: some View {
         ZStack {
@@ -42,109 +80,104 @@ struct SourceReader: View {
     }
 
     private var plate: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            header
-            Rectangle().fill(dim.opacity(0.16)).frame(height: 1)
-            content
+        let c = contrast
+        return VStack(alignment: .leading, spacing: 16) {
+            header(c)
+            Rectangle().fill(c.dim.opacity(0.22)).frame(height: 1)
+            content(c)
         }
         .padding(22)
         .frame(maxWidth: 1040, maxHeight: .infinity, alignment: .topLeading)
-        .glassPanel(corner: 28)
-        .shadow(color: .black.opacity(0.34), radius: 30, y: 16)
+        .background(
+            c.surface,
+            in: RoundedRectangle(cornerRadius: ChromeShape.radiusL, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: ChromeShape.radiusL, style: .continuous)
+                .strokeBorder(c.ink.opacity(0.10), lineWidth: 1))
+        .shadow(color: .black.opacity(c.artIsLight ? 0.40 : 0.30), radius: 30, y: 16)
     }
 
-    private var header: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 12) {
-            Button {
+    private func header(_ c: Contrast) -> some View {
+        HStack(alignment: .center, spacing: 12) {
+            CircleIconButton(
+                system: "chevron.left",
+                help: "Back to the answer",
+                diameter: ChromeShape.circle,
+                tint: accent
+            ) {
                 engine.closeSource()
-            } label: {
-                Label("Answer", systemImage: "chevron.left")
-                    .font(.callout.weight(.medium))
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(accent)
-            .help("Back to the answer")
-            .accessibilityLabel("Back to the answer")
 
             Spacer()
 
             VStack(alignment: .trailing, spacing: 2) {
                 Text(engine.readerSource?.book ?? "Source")
-                    .font(.headline).foregroundStyle(ink)
+                    .font(.system(size: TypeScale.title, weight: .semibold)).foregroundStyle(c.ink)
                 if let loc = engine.readerSource?.loc, !loc.isEmpty {
-                    Text(loc).font(.caption).foregroundStyle(dim)
+                    Text(loc).font(.system(size: TypeScale.caption)).foregroundStyle(c.dim)
                 }
             }
         }
     }
 
-    @ViewBuilder private var content: some View {
+    @ViewBuilder private func content(_ c: Contrast) -> some View {
         if engine.readerLoading {
             HStack(spacing: 10) {
                 ProgressView().controlSize(.small)
-                Text("Finding the source…").font(.callout).foregroundStyle(dim)
+                Text("Finding the source…").font(.callout).foregroundStyle(c.dim)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if engine.readerFailed {
             VStack(spacing: 8) {
                 Image(systemName: "text.book.closed")
-                    .font(.system(size: 24)).foregroundStyle(dim)
-                Text("Couldn't locate that passage").font(.callout).foregroundStyle(ink)
+                    .font(.system(size: 24)).foregroundStyle(c.dim)
+                Text("Couldn't locate that passage").font(.callout).foregroundStyle(c.ink)
                 Text("The index may not carry this edition yet.")
-                    .font(.caption).foregroundStyle(dim)
+                    .font(.caption).foregroundStyle(c.dim)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if let src = engine.readerSource, let text = src.text, !text.isEmpty {
             VStack(alignment: .leading, spacing: 18) {
-                if let q = src.quote, !q.isEmpty { quoteCard(q) }
-                passage(text, quote: src.quote)
+                if let q = src.quote, !q.isEmpty { quoteCard(q, c) }
+                passage(text, quote: src.quote, c)
             }
         }
     }
 
     /// The one solid focal: the exact sentence the citation points at.
-    private func quoteCard(_ q: String) -> some View {
+    private func quoteCard(_ q: String, _ c: Contrast) -> some View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: "quote.opening")
                 .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(accent.opacity(0.85))
+                .foregroundStyle(accent.opacity(0.90))
                 .padding(.top, 2)
             Text(q)
                 .font(.system(size: 16, design: .serif))
-                .foregroundStyle(quoteInk)
+                .foregroundStyle(c.ink)
                 .lineSpacing(3)
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
         }
         .padding(.horizontal, 16).padding(.vertical, 14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(quoteSurface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .background(
+            c.card,
+            in: RoundedRectangle(cornerRadius: ChromeShape.radiusM, style: .continuous))
     }
 
-    /// The surrounding book text, scrollable, with the quote softly washed.
-    private func passage(_ text: String, quote: String?) -> some View {
+    /// The surrounding book text, set in reading columns (1 → 2 → 3) with the
+    /// same pager the answer body uses, so a long passage pages rather than
+    /// stretching one narrow strip.
+    private func passage(_ text: String, quote: String?, _ c: Contrast) -> some View {
         GeometryReader { g in
-            let measure = min(TextStyle.measure(chars: 42), TextStyle.maxMeasure())
-            let w = max(260, min(measure, g.size.width))
-            ScrollView(.vertical) {
-                BookTextView(attr: attributed(text, quote: quote), width: w)
-                    .frame(width: w, alignment: .leading)
-                    .padding(.bottom, 24)
-            }
+            let w = max(260, min(1200, g.size.width))
+            ColumnText(
+                text: text, color: c.ink, availableWidth: w,
+                showsPager: true, highlight: quote
+            )
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(maxHeight: .infinity)
-    }
-
-    private func attributed(_ text: String, quote: String?) -> NSAttributedString {
-        let base = TextStyle.attributed(text, color: NSColor(ink), alignment: .justified)
-        guard let q = quote, !q.isEmpty, let r = text.range(of: q) else { return base }
-        let nsr = NSRange(r, in: text)
-        guard nsr.location != NSNotFound, nsr.length > 0 else { return base }
-        let m = NSMutableAttributedString(attributedString: base)
-        m.addAttribute(
-            .backgroundColor,
-            value: NSColor(accent).withAlphaComponent(0.20), range: nsr)
-        return m
     }
 }

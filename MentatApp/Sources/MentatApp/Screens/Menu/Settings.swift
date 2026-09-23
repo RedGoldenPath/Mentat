@@ -35,12 +35,12 @@ struct SettingsMenu: View {
             VStack(alignment: .leading, spacing: 16) {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("APPEARANCE").font(.caption2).tracking(2).foregroundStyle(pal.terracotta)
-                    Picker("", selection: $appearanceRaw) {
-                        ForEach(AppTheme.allCases) { t in
-                            Label(t.label, systemImage: t.symbol).tag(t.rawValue)
-                        }
-                    }
-                    .pickerStyle(.segmented).labelsHidden()
+                    GlassSegmentedControl(
+                        options: AppTheme.allCases,
+                        label: { $0.label },
+                        selection: Binding(
+                            get: { AppTheme(rawValue: appearanceRaw) ?? .fallback },
+                            set: { appearanceRaw = $0.rawValue }))
                     Toggle("Layout grid", isOn: ins(\.showGrid, false))
                     Toggle("Grid numbers", isOn: ins(\.numbers, true))
                 }
@@ -102,13 +102,13 @@ struct SettingsSheet: View {
                         HStack(spacing: 10) {
                             Text("Theme").foregroundStyle(pal.text).frame(
                                 width: 170, alignment: .leading)
-                            Picker("", selection: $appearanceRaw) {
-                                ForEach(AppTheme.allCases) { t in
-                                    Label(t.label, systemImage: t.symbol).tag(t.rawValue)
-                                }
-                            }
-                            .pickerStyle(.segmented)
-                            .labelsHidden().frame(minWidth: 150, maxWidth: 200)
+                            GlassSegmentedControl(
+                                options: AppTheme.allCases,
+                                label: { $0.label },
+                                selection: Binding(
+                                    get: { AppTheme(rawValue: appearanceRaw) ?? .fallback },
+                                    set: { appearanceRaw = $0.rawValue }))
+                            .frame(minWidth: 150, maxWidth: 240)
                             Spacer()
                         }
                         Text("Light — natural colour. Noir — contrasty black & white.")
@@ -235,7 +235,7 @@ struct SettingRow: View {
             .background(SettingPill(isLight: isLight))
             if let help = spec.help {
                 Text(help)
-                    .font(.system(size: 10))
+                    .font(.system(size: TypeScale.caption))
                     .foregroundStyle(dim)
                     .padding(.horizontal, 22)
                     .fixedSize(horizontal: false, vertical: true)

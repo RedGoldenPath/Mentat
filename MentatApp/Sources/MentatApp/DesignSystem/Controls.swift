@@ -105,69 +105,6 @@ extension View {
     func glassPanel(corner: CGFloat = 26) -> some View { modifier(GlassPanel(corner: corner)) }
 }
 
-/// Frosted capsule segmented control — a glass track with a sliding glass
-/// thumb behind the active option (the "pill" from the Liquid-Glass references).
-struct GlassSegmented: View {
-    let options: [AppTheme]
-    @Binding var selection: AppTheme
-    @Environment(\.palette) private var pal
-    @Environment(\.colorTheme) private var colorTheme
-    @Namespace private var ns
-
-    var body: some View {
-        HStack(spacing: 3) {
-            ForEach(options) { opt in
-                let active = opt == selection
-                Button {
-                    withAnimation(Anim.snappy) { selection = opt }
-                } label: {
-                    Text(opt.label)
-                        .font(.system(size: 12, weight: .medium))
-                        .lineLimit(1)
-                        .fixedSize(horizontal: true, vertical: false)
-                        .foregroundStyle(active ? colorTheme.accent : pal.text.opacity(0.72))
-                        .padding(.vertical, 7).padding(.horizontal, 10)
-                        .frame(maxWidth: .infinity)
-                        .background {
-                            if active {
-                                Capsule(style: .continuous)
-                                    .fill(.ultraThinMaterial)
-                                    .overlay(
-                                        Capsule().fill(
-                                            colorTheme.accent.opacity(pal.isDark ? 0.16 : 0.20))
-                                    )
-                                    .overlay(
-                                        Capsule(style: .continuous).stroke(
-                                            LinearGradient(
-                                                colors: [
-                                                    Color.white.opacity(pal.isDark ? 0.38 : 0.8),
-                                                    Color.white.opacity(0.05),
-                                                ],
-                                                startPoint: .top, endPoint: .bottom),
-                                            lineWidth: 1)
-                                    )
-                                    .shadow(
-                                        color: .black.opacity(pal.isDark ? 0.40 : 0.18), radius: 5,
-                                        y: 2
-                                    )
-                                    .matchedGeometryEffect(id: "seg", in: ns)
-                            }
-                        }
-                        .contentShape(Capsule())
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .padding(4)
-        .background(Capsule(style: .continuous).fill(.ultraThinMaterial))
-        .overlay(
-            Capsule(style: .continuous)
-                .stroke(Color.white.opacity(pal.isDark ? 0.16 : 0.35), lineWidth: 1)
-        )
-        .shadow(color: .black.opacity(pal.isDark ? 0.35 : 0.14), radius: 10, y: 4)
-    }
-}
-
 /// Applies the chosen appearance to the SwiftUI content AND the window/titlebar.
 struct AppearanceModifier: ViewModifier {
     @AppStorage("appearance") private var raw = AppTheme.fallback.rawValue
@@ -190,10 +127,11 @@ extension View {
 }
 
 /// Pins the hosting window's appearance so the system materials / Liquid Glass
-/// never re-resolve against the *system* light/dark scheme while the window is
-/// inactive. macOS otherwise flips vibrancy when the app loses focus, which is
-/// why the tint used to change every time you clicked off the app. Re-asserted
-/// on key/main changes because AppKit can reset a window's appearance there.
+/// resolve against the app's own light/dark scheme rather than the *system*
+/// scheme while the window is inactive. Note: this does NOT (and cannot) stop
+/// the platform from desaturating tinted glass in a non-key window — that is
+/// Liquid Glass's intended active/inactive behaviour. Re-asserted on key/main
+/// changes because AppKit can reset a window's appearance there.
 struct WindowAppearance: NSViewRepresentable {
     var theme: AppTheme
 

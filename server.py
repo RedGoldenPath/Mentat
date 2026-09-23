@@ -237,7 +237,6 @@ def _settings_payload():
         "model": ["deepseek-flash", "deepseek-think", "qwen", "qwen-deep"],
         "voice": list(getattr(bc, "VOICE_PRESETS", {}).keys()),
         "thinking": ["false", "true", "low", "medium", "high"],
-        "mode": list(getattr(bc, "VALID_MODES", ("naive", "local", "global", "hybrid", "mix"))),
         "routing": list(getattr(bc, "VALID_ROUTING", ("off", "heuristic", "hybrid"))),
         "search_depth": ["auto", "always", "off"],
         "self_heal": ["off", "detect", "remediate", "full"],
@@ -282,6 +281,18 @@ def _warm_models():
         bc.warm_models()
     except Exception:
         pass
+    # Self-heal charter: at boot, detect and repair non-major index drift
+    # (FTS/spans/graph/cache/lock) automatically when the setting allows.
+    # Major repairs (full re-embed) always require explicit approval.
+    try:
+        level = str(bc._load_settings().get("self_heal") or "remediate").lower()
+        if level in ("remediate", "full"):
+            report = asyncio.run(bc.self_heal_run(allow_major=False))
+            fixed = [f.get("issue") for f in (report or {}).get("fixed") or []]
+            if fixed:
+                print("[self-heal] repaired:", ", ".join(fixed), flush=True)
+    except Exception:
+        pass
 
 
 # Warm the local reranker + index caches off the boot path, so the first
@@ -297,10 +308,15 @@ async def _get_brain():
 
 
 def _citations(answer):
-    cites = [
-        {"book": m.group(1).strip(), "loc": m.group(2).strip()}
-        for m in _CITE_RE.finditer(answer or "")
-    ]
+    cites = []
+    for m in _CITE_RE.finditer(answer or ""):
+        # Split the inner text on every " · ": a 3+ part label
+        # ("(The Study Quran · 3:190 · p. 434)") must become book="The Study
+        # Quran", loc="3:190 · p. 434" — not book="… · 3:190".
+        inner = m.group(0)[1:-1].strip()
+        parts = [p.strip() for p in inner.split(" · ")]
+        if len(parts) >= 2 and parts[0]:
+            cites.append({"book": parts[0], "loc": " · ".join(parts[1:])})
     # de-dupe, keep order
     seen, uniq = set(), []
     for c in cites:
@@ -311,9 +327,9 @@ def _citations(answer):
     return uniq
 
 
-async def _ask(question, mode=None):
+async def _ask(question):
     brain = await _get_brain()
-    res = await brain.ask(question, mode=(mode or None), lazy=True)
+    res = await brain.ask(question, lazy=True)
     answer = res.get("answer") or ""
     return {
         "status": res.get("status"),
@@ -325,7 +341,7 @@ async def _ask(question, mode=None):
     }
 
 
-def _stream_ask(question, mode=None):
+def _stream_ask(question):
     """Yield ndjson-serializable dicts from the brain's streaming answer.
 
     Runs the async generator on the shared event loop and bridges each event
@@ -345,7 +361,7 @@ def _stream_ask(question, mode=None):
         brain._progress = _progress
         sent = 0
         try:
-            async for text in brain.ask_stream(question, mode=(mode or None)):
+            async for text in brain.ask_stream(question):
                 text = text or ""
                 delta = text[sent:]
                 sent = len(text)
@@ -409,7 +425,7 @@ async def _status():
         "model": model,
         "offline": offline,
         "offline_default": offline,
-        "kinds": list(getattr(bc, "VALID_MODES", ())),
+        "kinds": ["count", "quotes", "concept", "compare", "commentary", "research"],
     }
 
 
@@ -479,7 +495,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"\r\n")
         self.wfile.flush()
 
-    def _stream(self, question, mode):
+    def _stream(self, question):
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -487,7 +503,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         try:
-            for event in _stream_ask(str(question), mode):
+            for event in _stream_ask(str(question)):
                 line = json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n"
                 self._chunk(line)
         except (BrokenPipeError, ConnectionResetError):
@@ -548,7 +564,7 @@ class _Handler(BaseHTTPRequestHandler):
             data = {}
         try:
             if self.path.startswith("/ask/stream"):
-                self._stream(data.get("question", ""), data.get("mode"))
+                self._stream(data.get("question", ""))
             elif self.path.startswith("/command"):
                 self._json(_run(_command(data.get("cmd", ""), data.get("arg", ""))))
             elif self.path.startswith("/settings"):
@@ -567,7 +583,7 @@ class _Handler(BaseHTTPRequestHandler):
                 removed = brain.delete_conversation(data.get("id", ""))
                 self._json({"ok": True, "removed": removed})
             elif self.path.startswith("/ask"):
-                self._json(_run(_ask(str(data.get("question", "")), data.get("mode"))))
+                self._json(_run(_ask(str(data.get("question", "")))))
             else:
                 self._json({"error": "not found"}, 404)
         except Exception as exc:

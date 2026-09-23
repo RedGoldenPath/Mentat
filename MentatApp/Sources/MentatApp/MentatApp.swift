@@ -9,15 +9,12 @@ import Observation
 // Conversation, LibraryBook, DocBlock, SettingSpec, ChatRole, ChatMessage,
 // PageTurn) now live in Engine/Models.swift.
 
-/// A rounded rectangle that nests concentrically with its container on macOS 26
-/// (Apple's "concentric corners" guidance), falling back to a fixed radius.
+/// A rounded rectangle that nests concentrically with its container (Apple's
+/// "concentric corners" guidance).
 struct NestedShape: Shape {
     var radius: CGFloat
     func path(in rect: CGRect) -> Path {
-        if #available(macOS 26.0, *) {
-            return ConcentricRectangle().path(in: rect)
-        }
-        return RoundedRectangle(cornerRadius: radius, style: .continuous).path(in: rect)
+        ConcentricRectangle().path(in: rect)
     }
 }
 
@@ -309,14 +306,10 @@ struct MessageRow: View {
     /// Light adapts to the artwork behind it.
     private func scrim(_ r: BgRegion, strength: Double = 1) -> some View {
         let base = engine.scrimOpacity(r)
-        // Stained glass: with the theme on, the plate is the theme surface (hued);
-        // otherwise the classic neutral plate.
-        let color: Color = engine.useOKLCHTheme
-            ? engine.colorTheme.surface
-            : (pal.isDark ? .black : (engine.isLight(r) ? .white : .black))
-        let op = (pal.isDark && !engine.useOKLCHTheme) ? max(base, 0.60) : base
+        // Stained glass: the plate is the theme surface (hued), one surface for
+        // the whole page rather than a per-region neutral plate.
         return RoundedRectangle(cornerRadius: design.composition.bubbleCorner, style: .continuous)
-            .fill(color.opacity(op * strength))
+            .fill(engine.colorTheme.surface.opacity(base * strength))
     }
 
     /// Body ink for a bubble: light on Noir's dark bubbles, otherwise sampled
@@ -340,7 +333,7 @@ struct MessageRow: View {
     private func roleHeader(_ name: String, symbol: String, region: BgRegion) -> some View {
         HStack(spacing: 6) {
             Image(systemName: symbol).font(.system(size: TypeScale.micro, weight: .bold))
-            Text(name).font(.system(size: 10, weight: .semibold)).tracking(0.7)
+            Text(name).font(.system(size: TypeScale.caption, weight: .semibold)).tracking(0.7)
         }
         .foregroundStyle(bubbleDim(region))
     }
@@ -804,7 +797,7 @@ struct ChatView: View {
                 Text(title).lineLimit(1)
                 Spacer()
                 Image(systemName: "chevron.right")
-                    .font(.system(size: 10, weight: .bold))
+                    .font(.system(size: TypeScale.caption, weight: .bold))
                     .foregroundStyle(chrome.dim.opacity(0.6))
             }
             .font(.system(size: TypeScale.bodyMono, weight: .medium))
@@ -874,6 +867,17 @@ struct ChatView: View {
     /// The palette tool: OKLCH-native controls over the active colour system.
     /// Hue follows the image; chroma and contrast tune the resolved, contrast-
     /// enforced theme. No named schemes.
+    /// A small caption above a control, so the palette panel reads consistently
+    /// now that the pickers are glass capsules instead of system segmenteds.
+    @ViewBuilder private func labeledControl<Content: View>(
+        _ title: String, @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(.system(size: TypeScale.caption)).foregroundStyle(chrome.dim)
+            content()
+        }
+    }
+
     private var palettePicker: some View {
         let controls = engine.colorControls
         let theme = engine.colorTheme
@@ -889,7 +893,7 @@ struct ChatView: View {
                 color: chrome.dim,
                 availableWidth: TextStyle.measure(chars: 40, size: 12),
                 fontSize: 12)
-            Text("apply \(engine.useOKLCHTheme ? "on" : "off") · image \(engine.imagePalette.isNeutral ? "neutral" : "\(Int(engine.imagePalette.baseHue))°") · base \(Int(theme.baseHue))°")
+            Text("image \(engine.imagePalette.isNeutral ? "neutral" : "\(Int(engine.imagePalette.baseHue))°") · base \(Int(theme.baseHue))°")
                 .font(.system(size: TypeScale.micro, design: .monospaced))
                 .foregroundStyle(chrome.dim)
                 .fixedSize(horizontal: false, vertical: true)
@@ -897,10 +901,6 @@ struct ChatView: View {
             schemeList
 
             themePreview(theme)
-
-            Toggle("Apply to app", isOn: Binding(get: { engine.useOKLCHTheme },
-                                                 set: { engine.setUseOKLCHTheme($0) }))
-                .font(.caption2)
 
             sliderRow("Hue", value: theme.baseHue, range: 0...360, suffix: "°") { v in
                 var c = controls
@@ -921,23 +921,21 @@ struct ChatView: View {
                 set: { v in var c = controls; c.followImage = v; engine.setColorControls(c) }))
                 .font(.caption2)
 
-            Picker("Text ink", selection: Binding(
-                get: { engine.inkMode },
-                set: { engine.setInkMode($0) })) {
-                Text("Adaptive").tag(Engine.InkMode.background)
-                Text("Theme").tag(Engine.InkMode.theme)
+            labeledControl("Text ink") {
+                GlassSegmentedControl(
+                    options: [Engine.InkMode.background, .theme],
+                    label: { $0 == .background ? "Adaptive" : "Theme" },
+                    selection: Binding(
+                        get: { engine.inkMode }, set: { engine.setInkMode($0) }))
             }
-            .pickerStyle(.segmented)
-            .font(.caption2)
 
-            Picker("Glass", selection: Binding(
-                get: { engine.glassStyle },
-                set: { engine.setGlassStyle($0) })) {
-                Text("Tinted").tag(GlassStyle.tinted)
-                Text("Clear").tag(GlassStyle.clear)
+            labeledControl("Glass") {
+                GlassSegmentedControl(
+                    options: [GlassStyle.tinted, .clear],
+                    label: { $0 == .tinted ? "Tinted" : "Clear" },
+                    selection: Binding(
+                        get: { engine.glassStyle }, set: { engine.setGlassStyle($0) }))
             }
-            .pickerStyle(.segmented)
-            .font(.caption2)
 
             HStack(spacing: 8) {
                 Button("Reset") {
@@ -1102,42 +1100,25 @@ struct ChatView: View {
     /// The vertical strip of icon buttons. Appearance is a one-tap toggle
     /// (Hue ↔ Noir) rather than a panel — it only has two states.
     private var menuRail: some View {
-        VStack(spacing: 3) {
-            Button {
+        VStack(spacing: 6) {
+            CircleIconButton(
+                system: "circle.lefthalf.filled",
+                help: "Appearance: \(appearance.label) — click to switch (Hue ↔ Noir)",
+                diameter: ChromeShape.circle,
+                tint: railAccent
+            ) {
                 withAnimation(Anim.snappy) { cycleTheme() }
-            } label: {
-                Image(systemName: "circle.lefthalf.filled")
-                    .font(.system(size: 13, weight: .semibold))
-                    .frame(width: 36, height: 34)
-                    .foregroundStyle(chrome.ink.opacity(0.85))
-                    .contentShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
             }
-            .buttonStyle(.pressable)
-            .help("Appearance: \(appearance.label) — click to switch (Hue ↔ Noir)")
             ForEach(MenuPanel.allCases) { p in
-                Button {
+                CircleIconButton(
+                    system: p.symbol,
+                    help: p.title,
+                    diameter: ChromeShape.circle,
+                    active: menuPanel == p,
+                    tint: railAccent
+                ) {
                     withAnimation(Anim.snappy) { menuPanel = (menuPanel == p ? nil : p) }
-                } label: {
-                    Image(systemName: p.symbol)
-                        .font(.system(size: 13, weight: .semibold))
-                        .frame(width: 36, height: 34)
-                        .foregroundStyle(menuPanel == p ? railAccent : railInk.opacity(0.85))
-                        .background {
-                            if menuPanel == p {
-                                RoundedRectangle(cornerRadius: 11, style: .continuous)
-                                    .fill(.ultraThinMaterial)
-                                    .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous)
-                                        .fill(railAccent.opacity(0.18)))
-                                    .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous)
-                                        .stroke(railAccent.opacity(0.5), lineWidth: 1))
-                                    .shadow(color: .black.opacity(0.25), radius: 4, y: 2)
-                                    .transition(.scale(scale: 0.85).combined(with: .opacity))
-                            }
-                        }
-                        .contentShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
                 }
-                .buttonStyle(.pressable)
-                .help(p.title)
             }
         }
         .animation(Anim.snappy, value: menuPanel)
@@ -1181,7 +1162,7 @@ struct ChatView: View {
             // Design tokens — the same data the UI renders from.
             VStack(alignment: .leading, spacing: PanelGrid.gap(gridGutter) * 0.9) {
                 Text("DESIGN")
-                    .font(.system(size: 10, weight: .semibold))
+                    .font(.system(size: TypeScale.caption, weight: .semibold))
                     .tracking(1.1)
                     .foregroundStyle(chrome.ink.opacity(0.92))
                     .padding(.horizontal, 13).padding(.vertical, 6)
@@ -1196,7 +1177,7 @@ struct ChatView: View {
                     // section title as a small floating chip (the "Stress Relief"
                     // pill from the reference), rather than a bare label
                     Text(section.uppercased())
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(.system(size: TypeScale.caption, weight: .semibold))
                         .tracking(1.1)
                         .foregroundStyle(chrome.ink.opacity(0.92))
                         .lineLimit(1)
@@ -1254,7 +1235,7 @@ struct ChatView: View {
                 .frame(width: 7, height: 7)
                 .shadow(color: shadowColor, radius: 3)
             Text(engine.model)
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .font(.system(size: TypeScale.caption, weight: .semibold, design: .monospaced))
                 .foregroundStyle(ink(.center))
                 .lineLimit(1)
                 .fixedSize()
@@ -1383,13 +1364,9 @@ struct ChatView: View {
                 Spacer()
             }
             Group {
-                if #available(macOS 26.0, *) {
-                    // container spacing < HStack spacing, else the glass blobs
-                    // merge together at rest (per Apple's guidance)
-                    GlassEffectContainer(spacing: 3) { trailingControls }
-                } else {
-                    trailingControls
-                }
+                // container spacing < HStack spacing, else the glass blobs
+                // merge together at rest (per Apple's guidance)
+                GlassEffectContainer(spacing: 3) { trailingControls }
             }
             .glassMaterialize()
         }
@@ -1536,19 +1513,16 @@ struct ChatView: View {
                     // neutral glass otherwise.
                     Button(action: send) {
                         Image(systemName: engine.busy ? "stop.fill" : "arrow.up")
-                            .font(.system(size: 14, weight: .bold))
+                            .font(.system(size: TypeScale.emphasis, weight: .bold))
                             .contentTransition(.symbolEffect(.replace))
                             .frame(width: 32, height: 32)
                             .foregroundStyle(
                                 canSend
-                                    ? (engine.useOKLCHTheme ? engine.colorTheme.onAccent : .white)
+                                    ? engine.colorTheme.onAccent
                                     : engine.dim(.right))
                             .background {
                                 if canSend {
-                                    Circle().fill(
-                                        engine.useOKLCHTheme
-                                            ? engine.colorTheme.accent
-                                            : engine.accentColor(.center))
+                                    Circle().fill(engine.colorTheme.accent)
                                 } else {
                                     Circle().fill(.ultraThinMaterial)
                                 }
@@ -1639,20 +1613,18 @@ struct RootView: View {
     /// rather than sampling the photo: a dark, near-opaque panel with light text
     /// in Noir, and a light panel with dark text in Light.
     private var noir: Bool { theme == .mono }
-    // When the OKLCH theme is live, the rail follows it (hue from the image).
+    // The rail follows the OKLCH theme (hue from the image).
     private var panel: Color {
-        engine.useOKLCHTheme
-            ? engine.colorTheme.surface.opacity(0.94)
-            : (noir ? Color(white: 0.04).opacity(0.96) : Color(white: 0.96).opacity(0.82))
+        engine.colorTheme.surface.opacity(0.94)
     }
     private var panelInk: Color {
-        engine.useOKLCHTheme ? engine.colorTheme.ink : (noir ? Color(white: 0.96) : Color(white: 0.10))
+        engine.colorTheme.ink
     }
     private var panelDim: Color {
-        engine.useOKLCHTheme ? engine.colorTheme.inkDim : (noir ? Color(white: 0.64) : Color(white: 0.38))
+        engine.colorTheme.inkDim
     }
     private var panelAccent: Color {
-        engine.useOKLCHTheme ? engine.colorTheme.accent : (noir ? Color(white: 0.90) : engine.accentColor(.center))
+        engine.colorTheme.accent
     }
 
     // MARK: history — Siri-inspired pin / find
@@ -1846,8 +1818,7 @@ struct RootView: View {
                         .help("Executable build time · source revision")
                 }
                 .sidebarGlass(solid: panel,
-                              tint: engine.useOKLCHTheme
-                                  ? engine.colorTheme.surface.opacity(0.55) : nil)
+                              tint: engine.colorTheme.surface.opacity(0.55))
                 .background {
                     // the artwork behind the glass so it refracts the page photo
                     SidebarArtwork(name: engine.backgroundName,

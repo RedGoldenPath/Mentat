@@ -16,52 +16,6 @@ enum PaletteRole: String, CaseIterable, Codable {
     case inkDim             // secondary text
 }
 
-/// How the derived palette is put together from the image's dominant hue. This
-/// is the user-facing "palette style" — separate from which image is chosen.
-enum PaletteStyle: String, CaseIterable, Identifiable {
-    case complementary, analogous, triadic, split, main, secondary, tertiary, monochrome
-    var id: String { rawValue }
-
-    var label: String {
-        switch self {
-        case .complementary: return "Complementary"
-        case .analogous:     return "Analogous"
-        case .triadic:       return "Triadic"
-        case .split:         return "Split"
-        case .main:          return "Main"
-        case .secondary:     return "Secondary"
-        case .tertiary:      return "Tertiary"
-        case .monochrome:    return "Monochrome"
-        }
-    }
-
-    var accentOffset: Double {
-        switch self {
-        case .main:          return 0
-        case .analogous:     return 0.083     // +30°
-        case .secondary:     return 0.166     // +60°
-        case .tertiary:      return 0.333     // +120°
-        case .complementary: return 0.5       // +180°
-        case .triadic:       return 0.333     // +120°
-        case .split:         return 0.417     // +150° (split-complement)
-        case .monochrome:    return 0.5
-        }
-    }
-    var surfaceOffset: Double {
-        switch self {
-        case .main:          return 0
-        case .analogous:     return 0.083
-        case .secondary:     return 0.166
-        case .tertiary:      return 0.333
-        case .complementary: return 0.083
-        case .triadic:       return 0.166
-        case .split:         return 0.083
-        case .monochrome:    return 0
-        }
-    }
-    var monochrome: Bool { self == .monochrome }
-}
-
 /// Codable sRGB colour so a palette can be persisted next to its image.
 struct RGBA: Codable, Equatable {
     var r: Double, g: Double, b: Double, a: Double
@@ -375,73 +329,6 @@ enum PaletteAnalyzer {
         return NSColor(srgbRed: x.redComponent + (y.redComponent - x.redComponent) * t,
                        green: x.greenComponent + (y.greenComponent - x.greenComponent) * t,
                        blue: x.blueComponent + (y.blueComponent - x.blueComponent) * t, alpha: 1)
-    }
-}
-
-/// Turns an `ImageAnalysis` into a UI palette for a given style. The sampled
-/// clusters supply the *actual* main colours (dominant/secondary); hue + style
-/// derive the relational tones; brightness sets the value range.
-enum PaletteExtractor {
-    static func palette(from a: ImageAnalysis, style: PaletteStyle,
-                        dark: Bool = false, monochrome: Bool = false) -> BackgroundPalette {
-        guard !a.clusters.isEmpty else { return .placeholder }
-        let neutral = a.isNeutral || style.monochrome
-        let h = a.baseHue
-        let lum = a.brightness
-        let satBase = neutral ? 0 : min(0.80, max(0.26, a.saturation * 1.15))
-
-        func tone(_ dh: Double, sat: CGFloat, val: CGFloat, alpha: CGFloat = 1) -> RGBA {
-            guard !neutral else { return RGBA(NSColor(white: val, alpha: alpha)) }
-            let hue = CGFloat((h + dh).truncatingRemainder(dividingBy: 1))
-            return RGBA(NSColor(hue: hue < 0 ? hue + 1 : hue,
-                                saturation: sat, brightness: val, alpha: alpha))
-        }
-        /// Interpolate a value between its dark-art and bright-art endpoints.
-        func v(_ bright: CGFloat, _ dark: CGFloat) -> CGFloat { dark + (bright - dark) * CGFloat(lum) }
-
-        let inkVal: CGFloat = lum < 0.5 ? 1.0 : 0.03
-        let inkHue = CGFloat((h + 0.5).truncatingRemainder(dividingBy: 1))
-        let inkSat = neutral ? 0 : min(0.10, CGFloat(a.saturation) * 0.2)
-
-        var roles: [String: RGBA] = [:]
-        // The image's genuine main colours (this is what the percentages buy us).
-        roles[PaletteRole.dominant.rawValue] = a.clusters.first?.color ?? tone(0, sat: satBase, val: v(0.62, 0.5))
-        if let second = a.clusters.dropFirst().first {
-            roles[PaletteRole.secondary.rawValue] = second.color
-        } else {
-            roles[PaletteRole.secondary.rawValue] = tone(0.166, sat: satBase * 0.9, val: v(0.58, 0.44))
-        }
-        // Relational tones from the hue.
-        roles[PaletteRole.analogous.rawValue] = tone(0.083, sat: satBase * 0.9, val: v(0.54, 0.40))
-        roles[PaletteRole.complementary.rawValue] = tone(0.5, sat: satBase * 0.85, val: v(0.64, 0.66))
-        roles[PaletteRole.triadic.rawValue] = tone(0.333, sat: satBase * 0.85, val: v(0.60, 0.58))
-        // Style decides where the accent and rail sit on the wheel. The rail /
-        // large surfaces are darkened so the light rail ink stays legible, and
-        // they shift with the style so switching palettes retints the chrome.
-        roles[PaletteRole.accent.rawValue] = tone(style.accentOffset,
-                                                  sat: min(0.94, max(0.62, satBase)), val: 0.88)
-        roles[PaletteRole.surface.rawValue] = tone(style.surfaceOffset,
-                                                   sat: min(0.58, max(0.30, satBase * 0.85)),
-                                                   val: 0.20, alpha: 0.85)
-        roles[PaletteRole.ink.rawValue] = RGBA(NSColor(hue: inkHue, saturation: inkSat,
-                                                       brightness: inkVal, alpha: 1))
-        roles[PaletteRole.inkDim.rawValue] = RGBA(NSColor(hue: inkHue, saturation: inkSat,
-                                                          brightness: inkVal, alpha: 0.78))
-
-        // Material-style tokens: tonal palettes from the image hue, then roles.
-        // The primary hue honours the chosen scheme's accent offset. We build
-        // both schemes so always-dark surfaces (the rail) can use the dark set.
-        let tokenHue = (h + style.accentOffset).truncatingRemainder(dividingBy: 1)
-        // Boost chroma so even muted photos yield a visible Material palette.
-        let tokenChroma: CGFloat = (a.isNeutral || style.monochrome)
-            ? 0 : max(0.80, min(1.0, CGFloat(a.saturation) * 3.0))
-        let tokens = ColorTokens.make(hue: tokenHue, chroma: tokenChroma,
-                                      dark: dark, monochrome: monochrome)
-        let tokensDark = ColorTokens.make(hue: tokenHue, chroma: tokenChroma,
-                                          dark: true, monochrome: monochrome)
-
-        return BackgroundPalette(roles: roles, temperature: a.temperature,
-                                 isLight: a.isLight, tokens: tokens, tokensDark: tokensDark)
     }
 }
 
