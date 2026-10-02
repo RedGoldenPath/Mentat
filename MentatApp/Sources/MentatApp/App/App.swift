@@ -5,24 +5,20 @@ import CoreText
 // MARK: - App
 
 struct PaletteHost<Content: View>: View {
-    @AppStorage("appearance") private var appearanceRaw = AppTheme.fallback.rawValue
     private let engine = Engine.shared
     let content: Content
     init(@ViewBuilder content: () -> Content) { self.content = content() }
-    private var theme: AppTheme { AppTheme(rawValue: appearanceRaw) ?? .fallback }
     var body: some View {
         content
-            .environment(\.palette,
-                         Palette.forTheme(theme, colorTheme: engine.colorTheme))
-            .environment(\.appTheme, theme)
-            // the OKLCH color system — the contrast-enforced authority
+            .environment(\.palette, Palette.from(engine.colorTheme))
+            // the single colour authority — the contrast-enforced look theme
             .environment(\.colorTheme, engine.colorTheme)
             .environment(\.glassStyle, engine.glassStyle)
-            // the single global ink, resampled whenever the artwork/geometry changes
-            .environment(\.ink, AppInk(left: engine.adaptiveInk(.left),
-                                       center: engine.adaptiveInk(.center),
-                                       right: engine.adaptiveInk(.right),
-                                       top: engine.titleInk()))
+            // the one global ink, resolved from the look (never a photo)
+            .environment(\.ink, AppInk(left: engine.colorTheme.ink,
+                                       center: engine.colorTheme.ink,
+                                       right: engine.colorTheme.ink,
+                                       top: engine.colorTheme.ink))
     }
 }
 
@@ -33,8 +29,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         Task { @MainActor in
             await Engine.shared.ensureEngine()
+            // restore the thread the user was last in, so continuity survives a relaunch
+            if !Engine.shared.currentConv.isEmpty {
+                await Engine.shared.openConversation(Engine.shared.currentConv)
+            }
             await Engine.shared.loadConversations()
-            Engine.shared.loadBackgrounds()
+            if UserDefaults.standard.bool(forKey: "mentatDemoScene") {
+                Engine.shared.appendDemoScene()
+            }
+            if UserDefaults.standard.bool(forKey: "mentatDemoMarkdown") {
+                Engine.shared.appendDemoMarkdown()
+            }
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        // stop the engine this app started, so quitting the app frees the port + RAM
+        // (the engine also reaps any predecessor on the next launch via the same pidfile)
+        let pidfile = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Everything/mentat/app/mentat2_data/engine.pid")
+        if let s = try? String(contentsOf: pidfile, encoding: .utf8),
+           let pid = Int32(s.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            kill(pid, SIGTERM)
         }
     }
 }
@@ -59,8 +75,8 @@ struct MentatApp: App {
     var body: some Scene {
         Window("Mentat", id: "main") {
             PaletteHost { RootView(engine: engine) }
-                .applyAppearance()
-                .background(WindowAppearance(theme: appearance))
+                .applyAppearance(isDark: !engine.colorTheme.isLight)
+                .background(WindowAppearance(isDark: !engine.colorTheme.isLight))
                 .modifier(AppearIn())
         }
         .windowStyle(.hiddenTitleBar)
@@ -79,16 +95,17 @@ struct MentatApp: App {
                 .pickerStyle(.inline)
             }
             CommandMenu("Mentat") {
-                Button("Help") { Task { await engine.runCommand("help", "") } }
-                Button("Status") { Task { await engine.runCommand("status", "") } }
-                Divider()
-                Button("Debug Panel") { engine.debugMode.toggle() }
-                    .keyboardShortcut("d", modifiers: [.command, .option])
-                Divider()
-                Button("Shuffle Background") { engine.shuffleBackground() }
                 Button("New Conversation") { Task { await engine.newConversation() } }
                     .keyboardShortcut("n", modifiers: [.command, .shift])
                 Divider()
+                // Generated from the one command registry, so the menu bar can
+                // never drift from the ⌘K palette or the `/` menu.
+                ForEach(CommandRegistry.all(debug: false).filter { $0.isSlash }) { c in
+                    Button(c.title) { Task { await engine.runCommand(c.slash ?? "", "") } }
+                }
+                Divider()
+                Button("Debug Panel") { engine.debugMode.toggle() }
+                    .keyboardShortcut("d", modifiers: [.command, .shift])
             }
         }
 

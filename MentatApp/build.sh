@@ -43,6 +43,21 @@ if [ -d "$DIR/Resources" ]; then
   find "$DIR/Resources" -maxdepth 1 -type f -exec cp {} "$APP/Contents/Resources/" \;
 fi
 
+# --- metal shaders ---------------------------------------------------------
+# Compile the shared SandCore shader into the bundle's default metallib so
+# `SandPipeline` finds it. Needs the Metal Toolchain
+# (xcodebuild -downloadComponent MetalToolchain). Without it the app falls back
+# to the Canvas approximation.
+SAND_METAL="$DIR/../SandCore/Sources/SandCore/SandShaders.metal"
+rm -f "$APP/Contents/Resources/default.metallib"
+if xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+  mkdir -p "$DIR/.build"
+  xcrun -sdk macosx metal -c "$SAND_METAL" -o "$DIR/.build/sand.air"
+  xcrun -sdk macosx metallib "$DIR/.build/sand.air" -o "$APP/Contents/Resources/default.metallib"
+else
+  echo "build: Metal Toolchain missing — no default.metallib (Canvas fallback)" >&2
+fi
+
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -62,4 +77,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 PLIST
 
 codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || true
-echo "Built $APP"
+SIZE_MB=$(du -sm "$APP" | cut -f1)
+echo "Built $APP (${SIZE_MB} MB)"
+if [ "$SIZE_MB" -gt 30 ]; then
+  echo "build: WARNING — bundle ${SIZE_MB} MB exceeds the 30 MB cap" >&2
+fi

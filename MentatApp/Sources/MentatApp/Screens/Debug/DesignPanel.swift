@@ -41,6 +41,46 @@ struct DesignPanel: View {
                 stepperD("Panel pad", bind(store, \.metrics.panelPadMin), 4...24, 2)
                 stepperD("Panel radius", bind(store, \.metrics.panelRadiusPad), 0...20, 2)
             }
+            group("Surface") {
+                Picker("", selection: Binding(
+                    get: { store.tokens.material.role },
+                    set: { store.tokens.material.role = $0 }
+                )) {
+                    ForEach(MaterialRole.allCases, id: \.self) { r in
+                        Text(r.label).tag(r)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .controlSize(.mini)
+                .labelsHidden()
+            }
+            group("Bubbles") {
+                Picker("", selection: Binding(
+                    get: { store.tokens.bubble.role },
+                    set: { store.tokens.bubble.role = $0 }
+                )) {
+                    ForEach(MaterialRole.allCases, id: \.self) { Text($0.label).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .controlSize(.mini)
+                .labelsHidden()
+                slider("You", bind(store, \.bubble.userOpacity), 0.2...1.0, "%.2f")
+                slider("Mentat", bind(store, \.bubble.assistantOpacity), 0.2...1.0, "%.2f")
+            }
+            group("Tokens") {
+                HStack(spacing: 8) {
+                    Button("Export W3C") {
+                        if let d = store.exportW3CTokens(),
+                           let s = String(data: d, encoding: .utf8) {
+                            copyToPasteboard(s)
+                        }
+                    }
+                    .controlSize(.mini)
+                    Text("\(store.graph.allPaths.count) tokens")
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+            }
             HStack {
                 Spacer()
                 Button("Reset design") { store.reset() }

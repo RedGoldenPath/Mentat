@@ -39,6 +39,7 @@ struct CircleIconButton: View {
         Button(action: action) {
             Image(systemName: system)
                 .font(.system(size: d * 0.42, weight: .semibold))
+                .symbolEffect(.bounce, options: .speed(1.8), value: active)
                 .frame(width: d, height: d)
                 .contentShape(Circle())
         }

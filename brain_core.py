@@ -127,7 +127,7 @@ SETTINGS_DEFAULTS = {
     "planner_model": "",
     "synth_model": "",
     "long_context_model": "deepseek-v4-pro",
-    "auto_offline": False,
+    "auto_offline": True,
     "daily_budget": 0.0,
     "self_heal": "remediate",
     "hunt_limit": 36,
@@ -137,6 +137,10 @@ SETTINGS_DEFAULTS = {
     "auto_attribution": True,
     "filter_references": True,
     "learning_from_feedback": True,
+    "reasoning_mode": "auto",
+    "dialectic_brief": True,
+    "dialectic_ledger": True,
+    "local_fallback": True,
 }
 
 # Sections + plain-English help for the settings menus (CLI + TUI debug menu).
@@ -168,6 +172,10 @@ SETTINGS_SPEC = [
     {"key": "coverage_notes", "section": "Trust", "help": "warn the model when evidence is single-book"},
     {"key": "auto_attribution", "section": "Trust", "help": "auto-insert (Book · Chapter) after uncited quotes"},
     {"key": "filter_references", "section": "Trust", "help": "references list only works actually cited"},
+    {"key": "reasoning_mode", "section": "Reasoning", "help": "auto / strict / interpretive / dialectical (auto picks per question)"},
+    {"key": "dialectic_brief", "section": "Reasoning", "help": "build the cancel-preserve-raise brief before dialectical answers"},
+    {"key": "dialectic_ledger", "section": "Reasoning", "help": "carry the prior position forward so a conversation can sublate it"},
+    {"key": "local_fallback", "section": "Models", "help": "if an online call fails, silently fall back to the local model (off = fail loudly, never load local)"},
     {"key": "show_meta", "section": "Display", "help": "stat line under each answer"},
     {"key": "show_model", "section": "Display", "help": "include the serving model in the stat line"},
     {"key": "auto_reload", "section": "Display", "help": "restart the app when code changes"},
@@ -175,6 +183,10 @@ SETTINGS_SPEC = [
 
 VALID_THINKING = ("false", "true", "low", "medium", "high")
 VALID_ROUTING = ("off", "heuristic", "hybrid")
+# Reasoning methods are chosen per question; "auto" lets the selector decide.
+# strict = facts/quotes/counts, interpretive = close reading, dialectical =
+# the method (contradiction worked through, sublated, left open).
+REASONING_MODES = ("auto", "strict", "interpretive", "dialectical")
 
 VOICE_PRESETS = {
     "default": "",
@@ -242,45 +254,6 @@ VOICE_PRESETS = {
         "have set before me belongs to the science of government, and the books "
         "of this library treat it as such…' Answer completely; the chronicle "
         "is the form, the evidence the matter."
-    ),
-    "dialectic": (
-        "Voice — the Dialectician (Hegelian register, after Kojève's reading). "
-        "GRAMMAR: think in the SPIRAL of Aufhebung, NOT the triad. There is no "
-        "thesis → antithesis → synthesis template — that formula is a "
-        "caricature. Apply the three laws: (a) UNITY AND STRUGGLE OF OPPOSITES "
-        "— find the two opposed moments inside the subject and show how each "
-        "conditions the other; contradiction is the motor, not a defect; "
-        "(b) TRANSFORMATION OF QUANTITY INTO QUALITY — accumulated change "
-        "breaks into a qualitative leap; name the threshold; (c) NEGATION OF "
-        "THE NEGATION — the spiral. Hegel's movement is immanent: (1) begin inside the "
-        "position as it gives itself; (2) let its OWN contradiction emerge — "
-        "determinate negation: negate this specific content, not 'everything'; "
-        "(3) SUBLATE (aufheben): at once CANCEL, PRESERVE, and RAISE — the "
-        "earlier moment is neither kept intact nor discarded but carried up as "
-        "a moment of the new; (4) the result is a new immediacy that generates "
-        "its own contradiction, and the circle rises: nothing is lost, "
-        "everything is taken up. The negative is the motor, not an "
-        "embarrassment; truth is the whole, substance is subject — reality is "
-        "self-moving. In Kojève, the engine is RECOGNITION and desire: "
-        "self-consciousness exists only in being acknowledged, and history is "
-        "the spiral of struggles for recognition toward mutual recognition. "
-        "LEXICON as a system: Aufhebung, determinate negation, the negative, "
-        "becoming, Spirit, recognition, the end of history. STRUCTURE: "
-        "continuous prose that MOVES; a paragraph should not rest where it "
-        "began. TABOO: the thesis/antithesis/synthesis formula; 'both sides' "
-        "relativism; static enumeration; asserting a higher unity the evidence "
-        "will not bear. GROUNDING: quotes and numbers stay verbatim and cited; "
-        "mark invention with ⟪…⟫. SCOPE: for a plain quote/count question, "
-        "drop the form and answer straight. Example: 'The question asks how "
-        "many times \"mercy\" appears. As a bare quantity the number is a "
-        "positive fact — and at once it negates itself: a tally presumes a "
-        "counter and a boundary, so \"mercy\" counted already divides the text "
-        "into what falls within and without the word. Cancel the naïveté, "
-        "preserve the number, raise it: the count is true only as a moment in "
-        "the further question of what the text means by mercy — and so the "
-        "count returns, higher, as evidence for a reading rather than its "
-        "end.' Answer completely; the dialectic is the form, the evidence the "
-        "matter."
     ),
 }
 
@@ -381,11 +354,6 @@ NO_ANSWER_FALLBACKS = {
         "Of this matter the chronicles are silent, and silence is also a record.",
         "It is not related in any book of this library. Ask again, and with a narrower year.",
         "Let it be recorded that the question outran the sources.",
-    ],
-    "dialectic": [
-        "The thesis meets its own negation here: the library holds no answer to sublate.",
-        "The evidence negates the question — it is not in these books, and that absence is the antithesis.",
-        "Recognition fails: the sources do not affirm the claim you seek. Ask otherwise.",
     ],
 }
 
@@ -563,6 +531,22 @@ def _offline_gen_kwargs(question):
     return kwargs
 
 
+def _online_gen_kwargs(question, mode="strict"):
+    """Online output budget for dialectical answers.
+
+    ``query_llm`` defaults online to 16k-32k max tokens, so a reasoning writer
+    runs to 4-6k-token essays (~70s each). A dialectical answer gets the SAME
+    budget as the offline writer; other online paths are left untouched.
+    """
+    if mode != "dialectical":
+        return {}
+    try:
+        cap = int(_offline_gen_kwargs(question).get("max_tokens") or 0)
+    except Exception:
+        cap = 0
+    return {"max_tokens": cap} if cap else {}
+
+
 def _looks_truncated(ans):
     """True when an answer stops without terminal punctuation (cap clipped it)."""
     s = str(ans or "").rstrip()
@@ -644,6 +628,9 @@ DIALECTIC_REASONING = (
     "(Kojève) is the engine. NEVER write 'thesis, antithesis, synthesis' and "
     "never flatten the dialectic into a compare-and-contrast list. Keep every "
     "quotation verbatim and cited; mark invention with ⟪…⟫."
+    " BAN: never write the words 'thesis', 'antithesis', or 'synthesis' as "
+    "labels, headings, list items, or named steps. The movement is performed in "
+    "prose, never announced as a formula."
 )
 
 
@@ -659,13 +646,17 @@ BASE_RESPONSE_TEMPLATE = (
 )
 
 
-def _rag_system_prompt(interpretive=False):
+def _rag_system_prompt(interpretive=False, mode=None):
     """System prompt for the answer call.
 
-    ``interpretive`` swaps the strict grounding template for the
-    philosophical close-reader template (inference licensed, labeled).
+    ``mode`` is the reasoning method chosen by ``_reasoning_mode``:
+    ``strict`` (grounding only), ``interpretive`` (close reader), or
+    ``dialectical`` (close reader + the dialectical engine). The legacy
+    boolean ``interpretive`` is still honoured.
     """
-    if interpretive:
+    if mode is None:
+        mode = "interpretive" if interpretive else "strict"
+    if mode in ("interpretive", "dialectical"):
         base = INTERPRETIVE_SYSTEM_PROMPT + DIALECTIC_REASONING
     else:
         base = BASE_RESPONSE_TEMPLATE
@@ -1081,6 +1072,42 @@ def provider_status(force=False):
     return state
 
 
+def auto_offline_tick(force=True):
+    """Keep online/offline honest when ``auto_offline`` is on.
+
+    The default is ONLINE. The local model is used only when the API host is
+    genuinely unreachable (no wifi), and we flip back the moment it answers.
+    A manual toggle turns ``auto_offline`` off, so a user's choice is never
+    overridden behind their back.
+    """
+    try:
+        settings = _load_settings()
+    except Exception:
+        return None
+    if not settings.get("auto_offline", True):
+        return None
+    try:
+        reachable = bool(provider_status(force=force).get("reachable", True))
+    except Exception:
+        reachable = True  # never strand the user offline on a check error
+    desired = not reachable
+    if bool(settings.get("offline", False)) != desired:
+        settings["offline"] = desired
+        try:
+            _save_settings(settings)
+        except Exception:
+            pass
+        try:
+            _telemetry_log_feedback(
+                "auto_offline",
+                f"provider {'reachable' if reachable else 'unreachable'} "
+                f"\u2192 offline={desired}",
+            )
+        except Exception:
+            pass
+    return {"reachable": reachable, "offline": desired}
+
+
 # ---------------------------------------------------------------------------
 # Self-heal ("the Litany Loop") — detect broken subsystems, apply deterministic
 # remedies, log voice-aware quips. Major repairs (full re-embed, schema) need a
@@ -1318,6 +1345,10 @@ def _load_settings():
             saved = {}
     merged = dict(SETTINGS_DEFAULTS)
     merged.update({k: v for k, v in saved.items() if k in SETTINGS_DEFAULTS})
+    # The "dialectic" voice was removed — the dialectical METHOD lives in the
+    # reasoning mode, not a voice. A saved value now falls back to default.
+    if merged.get("voice") not in VOICE_PRESETS:
+        merged["voice"] = "default"
     return merged
 
 
@@ -1381,6 +1412,8 @@ def _coerce_setting(key, value):
         raise ValueError("search_depth must be auto, always, or off")
     if key == "voice":
         v = str(value).strip().lower()
+        if v == "dialectic":  # removed preset -> method, not a voice
+            return "default"
         if v in VOICE_PRESETS:
             return v
         raise ValueError(f"voice must be one of: {', '.join(VOICE_PRESETS)}")
@@ -1394,6 +1427,9 @@ def _coerce_setting(key, value):
         "filter_references",
         "learning_from_feedback",
         "auto_offline",
+        "dialectic_brief",
+        "dialectic_ledger",
+        "local_fallback",
     ):
         v = str(value).strip().lower()
         if v in ("1", "true", "yes", "on"):
@@ -1425,6 +1461,11 @@ def _coerce_setting(key, value):
         v = str(value or "").strip().lower()
         if v not in ("off", "detect", "remediate", "full"):
             raise ValueError("self_heal must be off, detect, remediate, or full")
+        return v
+    if key == "reasoning_mode":
+        v = str(value or "").strip().lower()
+        if v not in REASONING_MODES:
+            raise ValueError(f"reasoning_mode must be one of: {', '.join(REASONING_MODES)}")
         return v
     if key in ("planner_model", "synth_model", "long_context_model"):
         # preset keys ("deepseek-flash", "qwen") or any explicit model id;
@@ -2159,6 +2200,22 @@ def _offline():
         return False
 
 
+def _local_fallback_allowed():
+    """May an online call silently fall back to the local model?
+
+    Default yes (resilience: a dead API should still answer). Set
+    ``MENTAT_NO_LOCAL_FALLBACK=1`` or the ``local_fallback`` setting to false to
+    forbid it — an online run then FAILS LOUDLY instead of loading the 18 GB
+    local writer behind your back.
+    """
+    if os.getenv("MENTAT_NO_LOCAL_FALLBACK") == "1":
+        return False
+    try:
+        return bool(_load_settings().get("local_fallback", True))
+    except Exception:
+        return True
+
+
 def _lean():
     """Lean test profile: pin the optional retrieval layers so model A/B runs
     differ only by the model, not by retrieval variance.
@@ -2225,6 +2282,12 @@ async def query_llm(prompt, system_prompt=None, history_messages=None, **kwargs)
             _telemetry_log_feedback(
                 "fallback", f"{chosen}: {str(exc)[:160]}", _current_conv_id()
             )
+            if not _local_fallback_allowed():
+                raise
+    if not _local_fallback_allowed():
+        raise RuntimeError(
+            f"remote model unavailable for {chosen!r}; local fallback disabled"
+        )
     return await ollama_llm(
         prompt,
         system_prompt=system_prompt,
@@ -4198,6 +4261,8 @@ async def _fast_llm_call(prompt, system_prompt=None):
                     "llm_fallback",
                     f"{'planner' if cand == planner and planner else 'flash'}: {str(exc)[:120]}",
                 )
+    if not _local_fallback_allowed():
+        raise RuntimeError("helper model unavailable; local fallback disabled")
     return await ollama_llm(
         prompt, system_prompt=system_prompt, local_model=OLLAMA_FAST_MODEL,
         think=False, keep_alive=OLLAMA_FAST_KEEP_ALIVE,
@@ -4433,7 +4498,7 @@ async def _plan_question(question):
     if hit is not None:
         return hit
     out = {"kind": "", "phrase": "", "scope_hint": "", "books": [], "angles": [],
-           "hypothetical": "", "counter_queries": []}
+           "hypothetical": "", "counter_queries": [], "contradiction": ""}
     cached = _analysis(q)
     if any(cached.get(k) for k in ("kind", "phrase", "scope_hint", "books", "angles")):
         out.update({k: cached.get(k) or out[k] for k in out})
@@ -4459,11 +4524,13 @@ async def _plan_question(question):
         "  hypothetical: ONE sentence that would answer it, phrased as if quoted from a book\n"
         "  counter_queries: for argumentative/comparative questions, 1-3 search phrases\n"
         "    that would find OPPOSING or complicating evidence; else []\n"
+        "  contradiction: for argumentative questions, ONE search phrase for the\n"
+        "    tension INSIDE the subject (not a second source that disagrees); else \"\"\n"
         f"{prior_blk}"
         f"Available books: {titles}\n"
         f"Question: {question}\n"
         'Return ONLY JSON: {"kind":"","phrase":"","scope_hint":"","books":[],'
-        '"angles":[],"hypothetical":"","counter_queries":[]}'
+        '"angles":[],"hypothetical":"","counter_queries":[],"contradiction":""}'
     )
     use_writer = _offline() and _is_hard_question(question, _heuristic_kind(question))
     for attempt in (1, 2):
@@ -4475,9 +4542,9 @@ async def _plan_question(question):
                 raw = await _fast_llm(
                     prompt if attempt == 1 else
                     "One line JSON: kind, phrase, scope_hint, books, angles, "
-                    f"hypothetical, counter_queries. Question: {question}\n"
+                    f"hypothetical, counter_queries, contradiction. Question: {question}\n"
                     '{"kind":"","phrase":"","scope_hint":"","books":[],"angles":[],'
-                    '"hypothetical":"","counter_queries":[]}'
+                    '"hypothetical":"","counter_queries":[],"contradiction":""}'
                 )
             data = _parse_analysis_json(raw) or {}
             if data:
@@ -4490,6 +4557,7 @@ async def _plan_question(question):
                 out["counter_queries"] = [
                     str(x).strip() for x in (data.get("counter_queries") or []) if str(x).strip()
                 ][:3]
+                out["contradiction"] = str(data.get("contradiction") or "").strip()[:300]
                 if out["kind"] or out["phrase"] or out["hypothetical"] or out["angles"]:
                     break
         except Exception:
@@ -6374,6 +6442,10 @@ def _answer_path(question, strategy, kind):
         or _has_hunt_intent(question)
     ):
         return "standard"
+    # A dialectical question is never a short lookup: give it room to move even
+    # if it is phrased briefly.
+    if _is_dialectical(question):
+        return "standard"
     if len(q.split()) <= 12:
         return "fast"
     return "standard"
@@ -6798,6 +6870,8 @@ def _render_passage_block(passages, full=False, max_chars=None):
                 tag = " [front/back matter]"
         except Exception:
             tag = ""
+        if p.get("negation"):
+            tag += " [antithesis — evidence that resists the emerging answer]"
         if full:
             width = 2400 if len(passages) > 6 else 5200
             text = _long_citation_window(p, width=width)[:width]
@@ -7230,19 +7304,36 @@ async def _build_passages(question, strategy):
     except Exception:
         expansion = {}
 
+    try:
+        mode = _reasoning_mode(question, _question_kind(question))
+    except Exception:
+        mode = "strict"
     queries = [question]
     model_books = []
+    neg_queries = []
     if expansion:
         angles = [a for a in expansion.get("angles", []) if a]
         model_books = [b for b in expansion.get("books", []) if b]
-        # Dialectic: pull counter-evidence for argumentative questions.
-        counters = (
-            [c for c in expansion.get("counter_queries", []) if c]
-            if _is_argumentative(question)
-            else []
-        )
-        queries += angles[:4] + counters[:2]
-    queries = queries[:6]
+        if mode == "dialectical":
+            # Dialectic: pull the contradiction on purpose. The named immanent
+            # contradiction leads, then the counter-evidence — its own lane, not
+            # just another fused query.
+            neg_queries = [c for c in expansion.get("counter_queries", []) if c]
+            cont = str(expansion.get("contradiction") or "").strip()
+            if cont:
+                neg_queries = [cont] + neg_queries
+            neg_queries = list(dict.fromkeys(q for q in neg_queries if q))[:3]
+            queries += angles[:4] + neg_queries
+        else:
+            # Unchanged for facts/reads: keep the old query budget exactly.
+            counters = (
+                [c for c in expansion.get("counter_queries", []) if c]
+                if _is_argumentative(question)
+                else []
+            )
+            queries += angles[:4] + counters[:2]
+    queries = queries[: (7 if mode == "dialectical" else 6)]
+    neg_set = {q.lower().strip() for q in neg_queries}
     _retrieval_note("embedding your question…")
     # Batch embeddings: one Ollama call for the HyDE doc, one for all queries.
     embeds = {}
@@ -7256,12 +7347,16 @@ async def _build_passages(question, strategy):
     except Exception as exc:
         _retrieval_degrade(f"embedding: {exc}")
     _lists = []
+    neg_pool = []
     for q in queries:
         try:
-            _lists.append(await _librarian_search(
+            ps = await _librarian_search(
                 q, k=5,
                 embedding=embeds.get("hyde") if q == question else embeds.get(q),
-            ))
+            )
+            _lists.append(ps)
+            if q.lower().strip() in neg_set:
+                neg_pool.extend(ps)
         except Exception as exc:
             _retrieval_degrade(f"search: {exc}")
     _add(_rrf_fuse(_lists))
@@ -7445,6 +7540,14 @@ async def _build_passages(question, strategy):
         )
     else:
         final = _ensure_named_coverage(final, question, results)
+    # Dialectic: the contradiction must survive the cut. Ranking optimizes for
+    # relevance and can wash out the passage that opposes the answer; keep at
+    # least a couple of the negation-lane passages in the final block.
+    if mode == "dialectical" and neg_pool:
+        try:
+            final = _ensure_negation(final, neg_pool, min_n=2)
+        except Exception:
+            pass
     global _LAST_RETRIEVAL
     try:
         _LAST_RETRIEVAL = [
@@ -7780,6 +7883,58 @@ def _is_interpretive(question, score=None):
     return score >= 0.30
 
 
+# Signals that a question turns on a contradiction rather than a fact — the
+# questions that deserve the dialectical METHOD, not just close reading.
+_DIALECTIC_WORDS = (
+    "dialectic", "dialectical", "contradiction", "contradict", "self-contradict",
+    "sublat", "aufheb", "hegel", "marx", "negation", "negate", "thesis",
+    "antithesis", "critique", "criticize", "significan", "implication",
+    "on the one hand", "nature of", "ontology", "existential", "recognition",
+    "master and slave", "master-slave", "master/slave", "alienation",
+    "why does", "why do", "why is", "why are", "why did", "why would",
+    "negates", "self-undermin", "self-destroy", "undoes", "antagonism",
+    "class struggle", "class conflict", "exploitation", "surplus value",
+    "means of production", "mode of production",
+)
+
+
+def _is_dialectical(question):
+    """A contradiction-bearing question — one whose honest answer must work a
+    tension through, not report a fact."""
+    q = str(question or "").lower()
+    if any(w in q for w in _DIALECTIC_WORDS):
+        return True
+    return _is_argumentative(question) and any(
+        w in q for w in ("compare", "contrast", " versus ", " vs ", "between")
+    )
+
+
+def _reasoning_mode(question, kind=None, score=None):
+    """The per-question reasoning method — automatic, no toggle required.
+
+    strict       facts, quotes, counts — the unchanged grounding path
+    interpretive close reading, inference licensed
+    dialectical  the method: contradiction hunted, worked through, left open
+
+    ``reasoning_mode`` in settings overrides (auto = decide here). The classifier
+    kind is used when present; the deterministic heuristic otherwise.
+    """
+    override = str(_load_settings().get("reasoning_mode") or "auto").strip().lower()
+    if override in ("strict", "interpretive", "dialectical"):
+        return override
+    if kind is None:
+        kind = _question_kind(question)
+    if kind in ("count", "quotes", "fact", "chat"):
+        return "strict"
+    if _is_dialectical(question):
+        return "dialectical"
+    if score is None:
+        score = _question_heuristic_score(question)
+    if _is_interpretive(question, score):
+        return "interpretive"
+    return "strict"
+
+
 def _select_books(question, mp, limit=5):
     terms = _derive_terms(question)
     books = mp.get("books", {})
@@ -7909,6 +8064,351 @@ async def _rerank_passages(question, passages, top_n=8):
         return [passages[i] for i in order[:top_n]]
     except Exception:
         return passages[:top_n]
+
+
+# ---------------------------------------------------------------------------
+# Dialectical method — the engine, not the voice.
+#
+# When `_reasoning_mode` returns "dialectical", the pipeline stops converging:
+# it retrieves the contradiction on purpose (the negation lane), builds an
+# explicit cancel/preserve/raise brief from the evidence before writing, checks
+# the draft for movement afterwards, and carries the prior position forward so a
+# conversation develops instead of restating. Facts never touch any of this.
+# ---------------------------------------------------------------------------
+
+# Resolving a contradiction by deleting one side is the failure mode this
+# guards against: class and the state are SUBLATED (cancelled, preserved,
+# raised), never "abolished" or "eliminated".
+_LEXICON_ERASURE = re.compile(
+    r"\b(abolish(?:ed|es|ing)?|eliminat(?:e|ed|es|ing)|done away with|"
+    r"wiped? out|eradicat(?:e|ed|es|ing)|annihilat(?:e|ed|es|ing))\b",
+    re.I,
+)
+_LEXICON_TARGETS = ("class", "state", "proletariat", "bourgeois", "ruling")
+
+
+def _in_quote(text, idx):
+    """True when position ``idx`` sits inside a quotation.
+
+    Handles blockquotes (lines led by ``>``) and inline quotation marks \u2014
+    including a lone quoted WORD the answer is discussing rather than using
+    ("Abolished" means the content is discarded). Straight quotes are counted
+    (odd = inside); curly quotes are paired. A quote that opens and closes
+    before ``idx`` leaves it outside, which is what fixes the false positive.
+    """
+    line_start = text.rfind("\n", 0, idx) + 1
+    if text[line_start:idx + 1].lstrip().startswith(">"):
+        return True
+    pre = text[:idx]
+    if pre.count('"') % 2 == 1:
+        return True
+    if pre.count("\u201c") > pre.count("\u201d"):
+        return True
+    if pre.count("\u2018") > pre.count("\u2019"):
+        return True
+    return False
+
+
+def _lexicon_flags(answer):
+    """Deterministic vocabulary checks on a dialectical answer (warning strings)."""
+    a = str(answer or "")
+    flags = []
+    for m in _LEXICON_ERASURE.finditer(a):
+        window = a[max(0, m.start() - 140):m.end() + 140].lower()
+        if any(t in window for t in _LEXICON_TARGETS) and not _in_quote(a, m.start()):
+            flags.append(
+                f"'{m.group(0)}' applied to class/state \u2014 sublation cancels, "
+                "preserves, and raises; it does not abolish."
+            )
+    for m in re.finditer(r"\bnegat\w+\b", a, re.I):
+        window = a[max(0, m.start() - 60):m.end() + 120]
+        if not re.search(
+            r"\b(this|the|its|that|which|content|moment|position|claim|given|"
+            r"form|one|question|concept)\b", window, re.I
+        ) and not _in_quote(a, m.start()):
+            flags.append("'negation' used loosely \u2014 name WHAT is negated.")
+    out, seen = [], set()
+    for f in flags:
+        if f not in seen:
+            seen.add(f)
+            out.append(f)
+    return out[:4]
+
+
+_MOVEMENT_TERMS = {
+    "contradiction": ("contradict", "self-contradict", "internal contradiction",
+                      "tension within", "divided against"),
+    "opposites": ("unity of opposite", "opposed tendencies", "opposite",
+                  "each conditions", "mutually condition"),
+    "quantity_quality": ("qualitative leap", "quantity into quality",
+                         "quantitative", "threshold", "leap"),
+    "sublation": ("sublat", "aufheb", "cancel", "preserve", "raise",
+                  "taken up", "carried up"),
+    "negation": ("negation of the negation", "determinate negation", "negates"),
+    "material": ("material condition", "relation of production", "mode of production",
+                 "class contradiction", "means of production"),
+    "recognition": ("recognition", "anerkennung", "acknowledg", "misrecognition"),
+}
+_TRIAD_PHRASES = ("thesis, antithesis, synthesis", "thesis-antithesis-synthesis",
+                  "thesis antithesis synthesis")
+
+
+def _triad_used(low):
+    """The banned formula in any dress: the phrase, or 'thesis' and 'antithesis'
+    used as labels/steps."""
+    if any(t in low for t in _TRIAD_PHRASES):
+        return True
+    return "thesis" in low and "antithesis" in low
+_BOTHSIDES = ("both sides", "on the one hand", "on the other hand",
+              "it's complicated", "there are pros and cons")
+
+
+def _movement_report(answer):
+    """How much a draft actually MOVES (0-7) plus its dialectical failure flags.
+
+    Deterministic; no model call. A high score means the movement is present;
+    the flags catch its counterfeits (the triad, both-sides relativism, erasure
+    dressed up as resolution)."""
+    a = str(answer or "")
+    low = a.lower()
+    present = [name for name, terms in _MOVEMENT_TERMS.items()
+               if any(t in low for t in terms)]
+    triad = _triad_used(low)
+    both = sum(1 for t in _BOTHSIDES if t in low) >= 2
+    flags = _lexicon_flags(a)
+    if triad:
+        flags.append("used the banned thesis/antithesis/synthesis triad.")
+    if both and "sublat" not in low and "aufheb" not in low:
+        flags.append("both-sides hedging without a determinate resolution.")
+    return {"score": len(present), "present": present, "triad": triad,
+            "both_sides": both, "flags": flags}
+
+
+_SUBLATION_CACHE = {}
+
+
+async def _sublation_brief(question, passages):
+    """The architect step: from the evidence, name the movement in a small JSON.
+
+    Returns ``{central_contradiction, cancelled, preserved, raised,
+    new_contradiction}`` or ``{}`` on failure. Helper model, cached per question
+    \u2014 cheap, and only ever called for dialectical-mode answers."""
+    q = str(question or "")
+    hit = _SUBLATION_CACHE.get(q)
+    if hit is not None:
+        return hit
+    evidence = []
+    for p in (passages or [])[:8]:
+        ex = str(p.get("excerpt") or p.get("content", ""))[:600]
+        if ex:
+            evidence.append(f"[{str(p.get('file_path', ''))[:80]}] {ex}")
+    if not evidence:
+        _SUBLATION_CACHE[q] = {}
+        return {}
+    prompt = (
+        "Read the passages and answer with ONE JSON object describing the "
+        "dialectical movement of the question, grounded ONLY in the passages. "
+        "Do not summarize; name the movement.\n"
+        "  central_contradiction: the opposed tendencies INSIDE the subject "
+        "(not a disagreement between two sources)\n"
+        "  cancelled: what this movement gives up\n"
+        "  preserved: what it keeps\n"
+        "  raised: what it carries up to a higher level\n"
+        "  new_contradiction: the contradiction the result now generates\n"
+        "Return ONLY JSON: {\"central_contradiction\":\"\",\"cancelled\":\"\","
+        "\"preserved\":\"\",\"raised\":\"\",\"new_contradiction\":\"\"}\n\n"
+        f"Question: {question}\n\nPassages:\n" + "\n".join(evidence)
+    )
+    out = {}
+    try:
+        raw = await _fast_llm(prompt)
+        m = re.search(r"\{.*\}", raw or "", re.S)
+        data = json.loads(m.group(0)) if m else {}
+        for k in ("central_contradiction", "cancelled", "preserved", "raised",
+                  "new_contradiction"):
+            v = str(data.get(k) or "").strip()
+            if v:
+                out[k] = v[:400]
+    except Exception:
+        out = {}
+    if len(_SUBLATION_CACHE) > 128:
+        _SUBLATION_CACHE.clear()
+    _SUBLATION_CACHE[q] = out
+    return out
+
+
+def _render_sublation_block(brief):
+    """Render the brief as an instruction to PERFORM the movement."""
+    if not brief:
+        return ""
+    parts = [
+        "\n\n[Dialectical brief \u2014 the movement to perform, not to list. "
+        "Do NOT write these as headings or bullets; let the answer move through "
+        "them in prose. Do not use the thesis/antithesis/synthesis formula and "
+        "never label any part 'thesis', 'antithesis', or 'synthesis'.]"
+    ]
+    if brief.get("central_contradiction"):
+        parts.append(f"The contradiction inside the subject: {brief['central_contradiction']}.")
+    if brief.get("cancelled"):
+        parts.append(f"Cancelled: {brief['cancelled']}.")
+    if brief.get("preserved"):
+        parts.append(f"Preserved: {brief['preserved']}.")
+    if brief.get("raised"):
+        parts.append(f"Raised: {brief['raised']}.")
+    if brief.get("new_contradiction"):
+        parts.append(
+            "The new contradiction the result generates (leave it open): "
+            f"{brief['new_contradiction']}."
+        )
+    parts.append(
+        "Name what is given up, what is kept, and what is lifted; resolve by "
+        "movement, never by deleting one side or by 'both sides have merit'."
+    )
+    return " ".join(parts)
+
+
+async def _dialectic_revise(answer, question, brief=None):
+    """Online-only movement repair: one pass that fixes erasure / non-movement."""
+    a = str(answer or "").strip()
+    if _offline() or len(a) < 400 or not DEEPSEEK_API_KEY:
+        return answer
+    report = _movement_report(a)
+    problems = list(report["flags"])
+    if not report["score"]:
+        problems.append("the draft does not move dialectically \u2014 it reports.")
+    if not problems:
+        return answer
+    try:
+        revised = await deepseek_llm(
+            "Revise this answer so it THINKS dialectically instead of "
+            "summarizing. Keep every quotation verbatim and every citation "
+            "intact; change no fact. Fix each problem, using determinate "
+            "negation (name what is negated and what is sublated \u2014 "
+            "cancelled, preserved, raised). Never use the "
+            "thesis/antithesis/synthesis formula, and never resolve a "
+            "contradiction by erasing one side. Do not label any part "
+            "'thesis', 'antithesis', or 'synthesis'.\n\n"
+            "PROBLEMS:\n- " + "\n- ".join(problems[:6]) + "\n\n"
+            f"QUESTION: {str(question)[:400]}\n\nDRAFT:\n{a[:12000]}",
+            model=DEEPSEEK_FLASH_MODEL,
+            max_tokens=12000,
+        )
+    except Exception:
+        return answer
+    return str(revised or "").strip() or answer
+
+
+def _remember_thesis(question, answer, brief=None):
+    """Persist the position a dialectical answer reached, so the next turn can
+    negate and sublate it instead of starting flat."""
+    conv = _current_conv_id()
+    if not conv:
+        return
+    pos = ""
+    if brief and brief.get("new_contradiction"):
+        pos = brief["new_contradiction"]
+    if not pos:
+        pos = " ".join(str(answer or "").split())[:500]
+    if not pos:
+        return
+    try:
+        state = _load_state()
+        mem = dict(state.get("analysis_mem") or {})
+        entry = dict(mem.get(conv) or {})
+        entry["thesis"] = {
+            "question": str(question)[:300],
+            "position": pos[:600],
+            "ts": time.time(),
+        }
+        mem[conv] = entry
+        state["analysis_mem"] = mem
+        _save_state(state)
+    except Exception:
+        pass
+
+
+def _prior_thesis(conv_id):
+    """The position of the previous dialectical answer in this conversation."""
+    entry = _session_mem_for(conv_id)
+    t = entry.get("thesis") or {}
+    if not t.get("position"):
+        return {}
+    if (time.time() - (t.get("ts") or 0)) > _SESSION_MEM_MAX_AGE:
+        return {}
+    return t
+
+
+def _render_thesis_block(thesis):
+    if not thesis:
+        return ""
+    return (
+        "\n\n[Prior position in this conversation \u2014 take it up and work "
+        "against it. Do not repeat it; negate it determinately and carry what "
+        "it got right up into the new answer.]\n"
+        f"Earlier question: {thesis.get('question', '')}\n"
+        f"Position reached: {thesis.get('position', '')}"
+    )
+
+
+async def _dialectic_prompt_additions(question, passages, mode, ans_path, settings):
+    """Extra prompt text for dialectical mode: the cancel/preserve/raise brief
+    and the prior position to sublate. Returns ``(block, brief)``. Facts never
+    reach this — ``mode`` gates it."""
+    if mode != "dialectical":
+        return "", {}
+    block = ""
+    brief = {}
+    if settings.get("dialectic_brief", True) and (
+        ans_path == "heavy" or _is_argumentative(question)
+    ):
+        try:
+            brief = await _sublation_brief(question, passages)
+        except Exception:
+            brief = {}
+        block += _render_sublation_block(brief)
+    if settings.get("dialectic_ledger", True):
+        try:
+            conv = _current_conv_id()
+            if conv:
+                block += _render_thesis_block(_prior_thesis(conv))
+        except Exception:
+            pass
+    return block, brief
+
+
+def _ensure_negation(final, neg_pool, min_n=2):
+    """Guarantee the contradiction survives the final cut.
+
+    Opposing evidence is the engine of the method; ranking must not wash it out.
+    Missing negation passages are appended and marked for the renderer."""
+    if not neg_pool:
+        return final
+    have = {p.get("chunk_id") for p in final if p.get("chunk_id")}
+    seen, added, merged = set(), 0, list(final)
+    for p in neg_pool:
+        cid = p.get("chunk_id")
+        if not cid or cid in have or cid in seen:
+            continue
+        seen.add(cid)
+        q = dict(p)
+        q["negation"] = True
+        merged.append(q)
+        added += 1
+        if added >= min_n:
+            break
+    return merged
+
+
+def _dialectical_passages(passages, cap=10):
+    """Lean evidence for a dialectical answer: the contradiction lane is always
+    kept, then the top few others. Cuts the prefill that dominates local latency
+    without dropping the opposing evidence the method runs on."""
+    if not passages:
+        return passages
+    neg = [p for p in passages if p.get("negation")]
+    rest = [p for p in passages if not p.get("negation")]
+    keep = neg + rest[: max(0, cap - len(neg))]
+    return keep or passages
 
 
 async def _revise_for_argument(answer, question):
@@ -10244,22 +10744,24 @@ class Brain:
 
         lens = (settings.get("lens") or "").strip()
         score = _question_heuristic_score(question)
-        interpretive = _is_interpretive(question, score)
+        # Comprehension FIRST: the reasoning mode, strategy, and prompt all want
+        # the classifier's kind (compare/research -> universal evidence), not
+        # only keywords. Planning runs before the prompt is assembled.
+        try:
+            if _plan_needed(question, _heuristic_kind(question)) or _is_hard_question(question):
+                await _expand_query(question)
+        except Exception:
+            pass
+        mode = _reasoning_mode(question, _question_kind(question), score)
+        interpretive = mode in ("interpretive", "dialectical")
 
-        sys_template = _rag_system_prompt(interpretive=interpretive)
+        sys_template = _rag_system_prompt(interpretive=interpretive, mode=mode)
         if lens:
             lens_block = lens.replace("{", "{{").replace("}", "}}") + "\n\n"
             sys_template = lens_block + sys_template
         voice_block = VOICE_PRESETS.get(settings.get("voice", "default"), "")
         if voice_block:
             sys_template = voice_block + "\n\n" + sys_template
-        # Comprehension FIRST: the strategy choice below wants the classifier's
-        # kind (compare/research -> universal evidence), not just keywords.
-        try:
-            if _plan_needed(question, _heuristic_kind(question)) or _is_hard_question(question):
-                await _expand_query(question)
-        except Exception:
-            pass
         strategy = _retrieval_strategy(question, score)
         if strategy == "simple":
             strategy = "expand"  # the librarian grounds EVERY question now
@@ -10361,6 +10863,16 @@ class Brain:
         except Exception:
             pass
         sys_template = sys_template + _length_budget(question)
+        brief = {}
+        if mode == "dialectical":
+            try:
+                _dia_block, brief = await _dialectic_prompt_additions(
+                    question, passages, mode, ans_path, settings
+                )
+                if _dia_block:
+                    sys_template = sys_template + _dia_block
+            except Exception:
+                brief = {}
         try:
             if _question_kind(question) == "quotes":
                 _qdraft = _extract_quote_draft(question, passages)
@@ -10407,7 +10919,7 @@ class Brain:
                     question,
                     system_prompt=sys_template,
                     history_messages=conversation_history,
-                    **(_offline_gen_kwargs(question) if _offline() else {}),
+                    **(_offline_gen_kwargs(question) if _offline() else _online_gen_kwargs(question, mode)),
                 )
                 usage_snapshot = dict(_LAST_USAGE or {})
 
@@ -10541,13 +11053,40 @@ class Brain:
                     pass
             if answer and str(answer).strip():
                 route_low = str(_ROUTE_OVERRIDE or "").lower()
-                if route_low in ("deepseek-think", "qwen-deep"):
+                # Dialectical mode runs its own movement repair below — do not
+                # also run the generic critique (double revision, double latency).
+                if route_low in ("deepseek-think", "qwen-deep") and mode != "dialectical":
                     try:
                         revised = await _revise_for_argument(answer, question)
                         if revised and str(revised).strip():
                             answer = revised
                     except Exception:
                         pass
+                if mode == "dialectical":
+                    # Movement check (deterministic) + one online repair; then
+                    # carry this position forward for the next turn to sublate.
+                    try:
+                        report = _movement_report(answer)
+                        _telemetry_log_feedback(
+                            "dialectic",
+                            f"score={report['score']}/7 triad={int(report['triad'])} "
+                            f"flags={len(report['flags'])}",
+                            _current_conv_id(),
+                        )
+                    except Exception:
+                        pass
+                    if not _offline():
+                        try:
+                            revised = await _dialectic_revise(answer, question, brief)
+                            if revised and str(revised).strip():
+                                answer = revised
+                        except Exception:
+                            pass
+                    if settings.get("dialectic_ledger", True):
+                        try:
+                            _remember_thesis(question, answer, brief)
+                        except Exception:
+                            pass
         finally:
             _ROUTE_OVERRIDE = prev_route
         _t("answer")
@@ -10639,22 +11178,23 @@ class Brain:
 
         lens = (settings.get("lens") or "").strip()
         score = _question_heuristic_score(question)
-        interpretive = _is_interpretive(question, score)
-        sys_template = _rag_system_prompt(interpretive=interpretive)
+        # Comprehension FIRST — the reasoning mode, strategy, and prompt all want
+        # the classifier's kind (compare/research -> universal evidence, count ->
+        # census, quotes -> long windows), not only routing.
+        try:
+            if _plan_needed(question, _heuristic_kind(question)) or _is_hard_question(question):
+                await _expand_query(question)
+        except Exception:
+            pass
+        mode = _reasoning_mode(question, _question_kind(question), score)
+        interpretive = mode in ("interpretive", "dialectical")
+        sys_template = _rag_system_prompt(interpretive=interpretive, mode=mode)
         if lens:
             lens_block = lens.replace("{", "{{").replace("}", "}}") + "\n\n"
             sys_template = lens_block + sys_template
         voice_block = VOICE_PRESETS.get(settings.get("voice", "default"), "")
         if voice_block:
             sys_template = voice_block + "\n\n" + sys_template
-        # Comprehension FIRST — the classifier's kind (compare/research ->
-        # universal evidence, count -> census, quotes -> long windows) must
-        # drive the strategy and prompt choices, not only routing.
-        try:
-            if _plan_needed(question, _heuristic_kind(question)) or _is_hard_question(question):
-                await _expand_query(question)
-        except Exception:
-            pass
         strategy = _retrieval_strategy(question, score)
         if strategy == "simple":
             strategy = "expand"  # the librarian grounds EVERY question now
@@ -10771,6 +11311,16 @@ class Brain:
         except Exception:
             pass
         sys_template = sys_template + _length_budget(question)
+        brief = {}
+        if mode == "dialectical":
+            try:
+                _dia_block, brief = await _dialectic_prompt_additions(
+                    question, passages, mode, ans_path, settings
+                )
+                if _dia_block:
+                    sys_template = sys_template + _dia_block
+            except Exception:
+                brief = {}
         try:
             if _question_kind(question) == "quotes":
                 _qdraft = _extract_quote_draft(question, passages)
@@ -10849,7 +11399,7 @@ class Brain:
                     **(
                         _offline_gen_kwargs(question)
                         if _offline()
-                        else {}
+                        else _online_gen_kwargs(question, mode)
                     ),
                     )
                     async for chunk in stream_gen:
@@ -11025,13 +11575,38 @@ class Brain:
                     pass
             if answer and str(answer).strip():
                 route_low = str(used_model or _ROUTE_OVERRIDE or "").lower()
-                if route_low in ("deepseek-think", "qwen-deep"):
+                # Dialectical mode runs its own movement repair below — do not
+                # also run the generic critique (double revision, double latency).
+                if route_low in ("deepseek-think", "qwen-deep") and mode != "dialectical":
                     try:
                         revised = await _revise_for_argument(answer, question)
                         if revised and str(revised).strip():
                             answer = revised
                     except Exception:
                         pass
+                if mode == "dialectical":
+                    try:
+                        report = _movement_report(answer)
+                        _telemetry_log_feedback(
+                            "dialectic",
+                            f"score={report['score']}/7 triad={int(report['triad'])} "
+                            f"flags={len(report['flags'])}",
+                            _current_conv_id(),
+                        )
+                    except Exception:
+                        pass
+                    if not _offline():
+                        try:
+                            revised = await _dialectic_revise(answer, question, brief)
+                            if revised and str(revised).strip():
+                                answer = revised
+                        except Exception:
+                            pass
+                    if settings.get("dialectic_ledger", True):
+                        try:
+                            _remember_thesis(question, answer, brief)
+                        except Exception:
+                            pass
             _t("verify")
             contexts = _group_sources_by_book(refs)
             entry = {

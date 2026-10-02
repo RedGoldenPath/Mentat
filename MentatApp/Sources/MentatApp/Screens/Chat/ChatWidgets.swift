@@ -46,14 +46,25 @@ struct ActionButton: View {
     let help: String
     let action: () -> Void
     @Environment(\.palette) private var pal
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var hover = false
+    @State private var taps = 0
     var body: some View {
-        Button(action: action) {
-            Image(systemName: system).font(.caption2)
+        Button {
+            taps += 1
+            action()
+        } label: {
+            Image(systemName: system)
+                .font(.caption2)
+                .symbolEffect(.bounce, options: .speed(1.8), value: taps)
+                .scaleEffect(hover && !reduceMotion ? 1.12 : 1)
         }
-        .buttonStyle(.plain)
-        .foregroundStyle(pal.textDim)
+        .buttonStyle(.pressable)
+        .foregroundStyle(hover ? pal.text : pal.textDim)
         .help(help)
         .accessibilityLabel(help)
+        .onHover { hover = $0 }
+        .motion(Anim.snappy, value: hover)
     }
 }
 
@@ -65,12 +76,17 @@ struct ChipButton: View {
     let action: () -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var hover = false
+    @State private var taps = 0
 
     var body: some View {
-        Button(action: action) {
+        Button {
+            taps += 1
+            action()
+        } label: {
             Image(systemName: system)
                 .font(.system(size: 13, weight: .medium))
                 .frame(width: 30, height: 30)
+                .symbolEffect(.bounce, options: .speed(1.8), value: taps)
         }
         .buttonStyle(.glass)  // Apple's native Liquid Glass button
         .foregroundStyle(color)
@@ -79,36 +95,6 @@ struct ChipButton: View {
         .onHover { hover = $0 }
         .scaleEffect(hover && !reduceMotion ? 1.07 : 1)
         .animation(reduceMotion ? nil : Anim.snappy, value: hover)
-    }
-}
-
-struct StarField: View {
-    var body: some View {
-        Canvas { ctx, size in
-            var rng = LCG(state: 7)
-            let glyphs = ["·", "*", "+", "°", "•"]
-            let center = CGPoint(x: size.width * 0.5, y: size.height * 0.55)
-            let maxR = max(1, hypot(size.width * 0.5, size.height * 0.55))
-            for _ in 0..<260 {
-                let x = Double.random(in: 0...1, using: &rng) * size.width
-                let y = Double.random(in: 0...1, using: &rng) * size.height
-                let d = hypot(Double(x - center.x), Double(y - center.y)) / maxR
-                let edge = max(0.0, min(1.0, (d - 0.18) / 0.62))
-                let alpha = edge * edge
-                if alpha <= 0.03 { continue }
-                let g = glyphs[Int(Double.random(in: 0...4.999, using: &rng))]
-                let shade = Double.random(in: 0...1, using: &rng)
-                let color = Color(
-                    red: 0.85 + 0.15 * shade, green: 0.78 + 0.18 * shade, blue: 0.62 + 0.30 * shade
-                )
-                .opacity(alpha * 0.85)
-                ctx.draw(
-                    Text(g).font(.system(size: 6.5)).foregroundColor(color),
-                    at: CGPoint(x: x, y: y))
-            }
-        }
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
     }
 }
 

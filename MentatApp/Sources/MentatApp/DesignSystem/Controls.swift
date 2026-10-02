@@ -49,26 +49,6 @@ struct AppearIn: ViewModifier {
     }
 }
 
-struct ThemeToggleButton: View {
-    @AppStorage("appearance") private var appearanceRaw = AppTheme.fallback.rawValue
-    @Environment(\.palette) private var pal
-
-    private var appearance: AppTheme { AppTheme(rawValue: appearanceRaw) ?? .fallback }
-
-    var body: some View {
-        Button {
-            appearanceRaw = appearance.next.rawValue
-        } label: {
-            Image(systemName: appearance.symbol)
-                .font(.system(size: 13, weight: .medium))
-                .frame(width: 30, height: 30)
-        }
-        .buttonStyle(.glass)
-        .foregroundStyle(pal.text)
-        .help("Appearance: \(appearance.label) — click to switch (Hue ↔ Noir)")
-    }
-}
-
 /// Floating glass panel — real Liquid Glass material (`glassEffect`) with a
 /// refractive surface and a soft shadow. Honors Reduce Transparency.
 struct GlassPanel: ViewModifier {
@@ -77,27 +57,27 @@ struct GlassPanel: ViewModifier {
     @Environment(\.glassStyle) private var glassStyle
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     var corner: CGFloat
+    @ViewBuilder
     func body(content: Content) -> some View {
         let shape = RoundedRectangle(cornerRadius: corner, style: .continuous)
         if reduceTransparency {
-            return AnyView(
-                content
-                    .background(pal.bg2.opacity(0.96), in: shape)
-                    .overlay(
-                        shape.stroke(Color.white.opacity(pal.isDark ? 0.12 : 0.35), lineWidth: 1)
-                            .allowsHitTesting(false)
-                    )
-                    .shadow(color: .black.opacity(pal.isDark ? 0.42 : 0.20), radius: 24, y: 12))
-        }
-        var glass = Glass.regular
-        if colorTheme != .placeholder {
-            glass = glass.tint(
-                glassStyle == .clear ? colorTheme.clearTint : colorTheme.accentTint)
-        }
-        return AnyView(
+            content
+                .background(pal.bg2.opacity(0.96), in: shape)
+                .overlay(
+                    shape.stroke(Color.white.opacity(pal.isDark ? 0.12 : 0.35), lineWidth: 1)
+                        .allowsHitTesting(false)
+                )
+                .shadow(color: .black.opacity(pal.isDark ? 0.42 : 0.20), radius: 24, y: 12)
+        } else {
+            let glass =
+                colorTheme != .placeholder
+                ? Glass.regular.tint(
+                    glassStyle == .clear ? colorTheme.clearTint : colorTheme.accentTint)
+                : Glass.regular
             content
                 .glassEffect(glass, in: shape)
-                .shadow(color: .black.opacity(pal.isDark ? 0.34 : 0.18), radius: 22, y: 10))
+                .shadow(color: .black.opacity(pal.isDark ? 0.34 : 0.18), radius: 22, y: 10)
+        }
     }
 }
 
@@ -105,25 +85,52 @@ extension View {
     func glassPanel(corner: CGFloat = 26) -> some View { modifier(GlassPanel(corner: corner)) }
 }
 
-/// Applies the chosen appearance to the SwiftUI content AND the window/titlebar.
+/// Applies the **effective** look's light/dark to the SwiftUI content AND the
+/// window/titlebar, so the window follows `ColorTheme` (the one colour authority)
+/// rather than a separate appearance flag.
 struct AppearanceModifier: ViewModifier {
-    @AppStorage("appearance") private var raw = AppTheme.fallback.rawValue
-    private var theme: AppTheme { AppTheme(rawValue: raw) ?? .fallback }
+    var isDark: Bool
 
     func body(content: Content) -> some View {
         content
-            .preferredColorScheme(theme.colorScheme)
+            .preferredColorScheme(isDark ? .dark : .light)
             .onAppear { apply() }
-            .onChange(of: raw) { _, _ in apply() }
+            .onChange(of: isDark) { _, _ in apply() }
     }
 
     private func apply() {
-        NSApp.appearance = NSAppearance(named: theme == .hue ? .aqua : .darkAqua)
+        NSApp.appearance = NSAppearance(named: isDark ? .darkAqua : .aqua)
     }
 }
 
 extension View {
-    func applyAppearance() -> some View { modifier(AppearanceModifier()) }
+    func applyAppearance(isDark: Bool) -> some View { modifier(AppearanceModifier(isDark: isDark)) }
+}
+
+/// Reports the window's top safe-area inset (titlebar band) so the grid can sit
+/// below it. Reads `NSView.safeAreaInsets` and falls back to the traffic-light
+/// height when the system reports zero. Reference: Apple HIG *Layout* + AppKit
+/// `NSView.safeAreaInsets`.
+struct TopInsetReader: NSViewRepresentable {
+    var onChange: (CGFloat) -> Void
+
+    func makeNSView(context: Context) -> NSView {
+        let v = NSView()
+        DispatchQueue.main.async { report(v) }
+        return v
+    }
+
+    func updateNSView(_ v: NSView, context: Context) {
+        DispatchQueue.main.async { report(v) }
+    }
+
+    private func report(_ v: NSView) {
+        guard let w = v.window else { return }
+        let safe = w.contentView?.safeAreaInsets.top ?? 0
+        // A hidden-titlebar window often reports 0, so fall back to the standard
+        // traffic-light band height (Apple's ~28pt) rather than clipping.
+        onChange(safe > 1 ? safe : 28)
+    }
 }
 
 /// Pins the hosting window's appearance so the system materials / Liquid Glass
@@ -133,15 +140,15 @@ extension View {
 /// Liquid Glass's intended active/inactive behaviour. Re-asserted on key/main
 /// changes because AppKit can reset a window's appearance there.
 struct WindowAppearance: NSViewRepresentable {
-    var theme: AppTheme
+    var isDark: Bool
 
     // TRANSITIONAL: main-thread-only coordinator (AppKit window appearance).
     final class Coordinator: @unchecked Sendable {
-        var theme: AppTheme = .fallback
+        var isDark = true
         var observers: [NSObjectProtocol] = []
         @MainActor func apply(to view: NSView) {
             guard let w = view.window else { return }
-            let name: NSAppearance.Name = theme == .hue ? .aqua : .darkAqua
+            let name: NSAppearance.Name = isDark ? .darkAqua : .aqua
             if w.appearance?.name != name { w.appearance = NSAppearance(named: name) }
         }
     }
@@ -151,7 +158,7 @@ struct WindowAppearance: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         let v = NSView()
         let coord = context.coordinator
-        coord.theme = theme
+        coord.isDark = isDark
         let c = NotificationCenter.default
         let names: [Notification.Name] = [
             NSWindow.didBecomeKeyNotification,
@@ -171,7 +178,7 @@ struct WindowAppearance: NSViewRepresentable {
 
     func updateNSView(_ v: NSView, context: Context) {
         let coord = context.coordinator
-        coord.theme = theme
+        coord.isDark = isDark
         DispatchQueue.main.async { MainActor.assumeIsolated { coord.apply(to: v) } }
     }
 }

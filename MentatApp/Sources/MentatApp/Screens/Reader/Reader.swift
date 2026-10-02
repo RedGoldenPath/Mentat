@@ -127,23 +127,69 @@ struct ArrowKeyMonitor: NSViewRepresentable {
 struct BookText: View {
     let text: String
     let color: Color
+    var ink: TextInk? = nil
     var onTap: (() -> Void)? = nil
     var body: some View {
         let measure = min(TextStyle.measure(chars: 40), TextStyle.maxMeasure())
         let w = max(40, TextStyle.hugWidth(text, max: measure))
         BookTextView(
-            attr: TextStyle.attributed(text, color: NSColor(color), alignment: .center),
+            attr: TextStyle.attributed(text, color: NSColor(color), ink: ink, alignment: .center),
             width: w, onTap: onTap)
     }
 }
 
+/// A single, continuous reading column for chat answers: no column spilling and
+/// no pagination — the text simply flows down, the way a normal chat app reads.
+/// Capped at a comfortable width so it never becomes a full-width wall of text.
+struct ReadingColumn: View {
+    let text: String
+    let color: Color
+    let availableWidth: CGFloat
+    var ink: TextInk? = nil
+    var fontSize: CGFloat? = nil
+    var highlight: String? = nil
+    var onTap: (() -> Void)? = nil
+    @Environment(LayoutGridStore.self) private var layoutStore: LayoutGridStore?
+
+    /// The column width: the book measure for the current size, never wider than
+    /// the space available. The column itself is centred on the page.
+    private var width: CGFloat {
+        let sz = fontSize ?? TextStyle.fontSize
+        return max(280, min(availableWidth, TextStyle.maxMeasure(size: sz)))
+    }
+    private var baseline: CGFloat {
+        guard let b = layoutStore?.grid.baseline, b > 2 else { return 0 }
+        return b
+    }
+
+    var body: some View {
+        let ns = NSColor(color)
+        var attr = TextStyle.attributed(
+            text, color: ns, ink: ink, alignment: .justified, baseline: baseline, size: fontSize)
+        // Softly wash the cited quote (source reader), same as the paged body.
+        if let hl = highlight, !hl.isEmpty, let r = text.range(of: hl) {
+            let nsr = NSRange(r, in: text)
+            if nsr.location != NSNotFound, nsr.length > 0 {
+                let wash = NSColor(Engine.shared.accentColor(.center)).withAlphaComponent(0.20)
+                let m = NSMutableAttributedString(attributedString: attr)
+                m.addAttribute(.backgroundColor, value: wash, range: nsr)
+                attr = m
+            }
+        }
+        // Natural column width (the measure); the parent centres it on the page,
+        // so the answer reads as a centred, justified column of text.
+        return BookTextView(attr: attr, width: width, onTap: onTap)
+    }
+}
+
 /// Assistant body text: measured line breaks, strict `linesPerColumn`-line
-/// columns that fill and spill 1 → 2 → 3, then page mode. All the pagination
+/// columns that fill and spill 1 → up to the token max, then page mode. All the pagination
 /// math lives in the pure `PageEngine`; this view owns only state + rendering.
 struct PagedText: View {
     let text: String
     let color: Color
     let availableWidth: CGFloat
+    var ink: TextInk? = nil
     /// Identity of the owning message, so arrow-key turn requests can be matched.
     var messageID: UUID
     /// Externally-driven page turn (set by the arrow keys when this answer is
@@ -292,7 +338,7 @@ struct PagedText: View {
     nonisolated(unsafe) private static var resolvedCache: [String: ResolvedEntry] = [:]
     private func cachedResolved() -> Resolved {
         let key =
-            "\(text.count)|\(Int(availableWidth))|\(linesPerColumn ?? design.typography.linesPerColumn)|\(maxColumns ?? design.typography.maxColumns)|\(Int(baseline))|\(Int(spacing))|\(Int(fontSize ?? 0))|\(highlight?.hashValue ?? 0)"
+            "\(text.count)|\(ink?.cacheKey ?? "-")|\(Int(availableWidth))|\(linesPerColumn ?? design.typography.linesPerColumn)|\(maxColumns ?? design.typography.maxColumns)|\(Int(baseline))|\(Int(spacing))|\(Int(fontSize ?? 0))|\(highlight?.hashValue ?? 0)"
         if let hit = PagedText.resolvedCache[key], hit.text == text { return hit.resolved }
         let fresh = resolve()
         if PagedText.resolvedCache.count > 120 { PagedText.resolvedCache.removeAll() }
@@ -305,17 +351,17 @@ struct PagedText: View {
         defer { Perf.record("layout", ms: (CFAbsoluteTimeGetCurrent() - started) * 1000) }
         let ns = NSColor(color)
         let justified = TextStyle.attributed(
-            text, color: ns, alignment: .justified, baseline: baseline, size: fontSize)
+            text, color: ns, ink: ink, alignment: .justified, baseline: baseline, size: fontSize)
         // Everything is measured at the fixed book measure: one column is worth
         // `linesPerColumn` lines there. The column count therefore comes from
-        // how many measure-columns the text needs — 1, then 2, then 3, then a
+        // how many measure-columns the text needs — 1, then 2, then a
         // new page — and resizing the window never changes it.
         let lines = TextLayout.lineRanges(justified, width: measure)
         let layout = engine.layout(lineCount: lines.count, availableWidth: availableWidth)
         var attr =
             layout.centredSingleColumn
             ? TextStyle.attributed(
-                text, color: ns, alignment: .center, baseline: baseline, size: fontSize)
+                text, color: ns, ink: ink, alignment: .center, baseline: baseline, size: fontSize)
             : justified
         // Softly tint the cited quote inside the passage (no outline, just a wash).
         if let hl = highlight, !hl.isEmpty, let r = text.range(of: hl) {

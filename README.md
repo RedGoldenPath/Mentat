@@ -106,8 +106,11 @@ Stored in `storage/settings.json`. Keys:
 | `temperature`   | `0`-`2` or `none`                                         | answer creativity                       |
 | `top_k`         | integer                                                   | how many graph nodes to pull            |
 | `chunk_top_k`   | integer                                                   | how many text chunks to pull            |
-| `sweep_depth`   | integer (default `6`)                                      | passages pulled per book when the question demands a multi-book sweep |
+| `sweep_depth`   | integer (default `6`)                                     | passages pulled per book when the question demands a multi-book sweep |
 | `lens`          | free text                                                 | framing injected into every answer      |
+| `reasoning_mode`| `auto` · `strict` · `interpretive` · `dialectical`        | reasoning method; `auto` picks per question |
+| `dialectic_brief`| `true` / `false`                                         | build the cancel/preserve/raise brief before dialectical answers |
+| `dialectic_ledger`| `true` / `false`                                        | carry the prior position forward so a conversation can sublate it |
 
 When a question spans books — "across the Dune series", "in all your books" —
 the brain resolves which works it demands (named works first, then every work

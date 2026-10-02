@@ -16,6 +16,7 @@ struct ConversationCard: View {
     let isLight: Bool
     let onTap: () -> Void
     var onPin: () -> Void = {}
+    var onEdit: () -> Void = {}
     let onDelete: () -> Void
     @State private var hover = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -24,48 +25,75 @@ struct ConversationCard: View {
     private var turnsLabel: String { "\(turns) turn\(turns == 1 ? "" : "s")" }
 
     var body: some View {
-        Button(action: onTap) {
-            content
-                .padding(12)
+        ZStack(alignment: .topTrailing) {
+            surface
+            content.padding(12)
                 .frame(maxWidth: .infinity, alignment: .topLeading)
-                .background {
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 18, style: .continuous).fill(
-                            .ultraThinMaterial)
-                        // theme-tinted translucent base, so the card takes the image hue
-                        if colorTheme != .placeholder {
-                            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                                .fill(colorTheme.surface.opacity(isLight ? 0.45 : 0.55))
-                        }
-                        RoundedRectangle(cornerRadius: 18, style: .continuous)
-                            .fill(
-                                selected
-                                    ? accent.opacity(isLight ? 0.16 : 0.24)
-                                    : ink.opacity(hover ? 0.07 : 0))
-                    }
-                }
-                .overlay(
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .stroke(
-                            selected ? accent.opacity(0.9) : ink.opacity(0.14),
-                            lineWidth: selected ? 1.5 : 1)
-                )
-                .shadow(
-                    color: .black.opacity(hover ? 0.28 : 0.14),
-                    radius: hover ? 10 : 5, y: hover ? 5 : 2
-                )
-                .scaleEffect(hover && !reduceMotion ? 1.015 : 1)
-                .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+            if hover && !reduceMotion {
+                actionBar
+                    .padding(8)
+            } else if hover {
+                actionBar.padding(8)
+            }
         }
-        .buttonStyle(.pressable)
+        .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .onTapGesture(perform: onTap)
         .onHover { hover = $0 }
         .animation(reduceMotion ? nil : Anim.snappy, value: hover)
         .animation(reduceMotion ? nil : Anim.snappy, value: selected)
         .contextMenu {
             Button(pinned ? "Unpin Conversation" : "Pin Conversation", action: onPin)
+            Button("Edit Title…", action: onEdit)
             Divider()
             Button("Delete Conversation", role: .destructive, action: onDelete)
         }
+    }
+
+    /// Hover-revealed edit / delete affordances.
+    private var actionBar: some View {
+        HStack(spacing: 6) {
+            iconButton("pencil", help: "Edit title", tint: ink, action: onEdit)
+            iconButton("trash", help: "Delete conversation", tint: .red, action: onDelete)
+        }
+        .padding(4)
+        .background(.ultraThinMaterial, in: Capsule(style: .continuous))
+        .overlay(Capsule(style: .continuous).stroke(ink.opacity(0.14), lineWidth: 1))
+        .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
+    }
+
+    private func iconButton(_ system: String, help: String, tint: Color,
+                            action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: system)
+                .font(.system(size: TypeScale.caption, weight: .semibold))
+                .foregroundStyle(tint)
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+        .accessibilityLabel(help)
+    }
+
+    private var surface: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 18, style: .continuous).fill(.ultraThinMaterial)
+            if colorTheme != .placeholder {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(colorTheme.surface.opacity(isLight ? 0.45 : 0.55))
+            }
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(selected ? accent.opacity(isLight ? 0.16 : 0.24)
+                               : ink.opacity(hover ? 0.07 : 0))
+        }
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(selected ? accent.opacity(0.9) : ink.opacity(0.14),
+                        lineWidth: selected ? 1.5 : 1)
+        )
+        .shadow(color: .black.opacity(hover ? 0.28 : 0.14),
+                radius: hover ? 10 : 5, y: hover ? 5 : 2)
+        .scaleEffect(hover && !reduceMotion ? 1.015 : 1)
     }
 
     @ViewBuilder private var content: some View {

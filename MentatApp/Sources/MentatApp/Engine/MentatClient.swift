@@ -32,6 +32,9 @@ struct CommandResult: Decodable {
     let text: String?
 }
 
+/// Response of `/conversation/new`: the id of the freshly minted thread.
+struct NewConversationResponse: Decodable { let id: String? }
+
 // MARK: - Client
 
 /// Typed HTTP client for the local engine. One place owns the routes, methods,
@@ -105,7 +108,20 @@ struct MentatClient: Sendable {
     func openConversation(id: String) async {
         if !isFixture { await postVoid("conversation/open", body: ["id": id]) }
     }
-    func newConversation() async { if !isFixture { await postVoid("conversation/new") } }
+    func newConversation() async -> String? {
+        if isFixture { return nil }
+        let r: NewConversationResponse? = try? await post("conversation/new", body: [:])
+        return r?.id
+    }
+    func renameConversation(id: String, title: String) async {
+        if !isFixture { await postVoid("conversation/rename", body: ["id": id, "title": title]) }
+    }
+    func truncateConversation(id: String, keep: Int) async {
+        if !isFixture { await postVoid("conversation/truncate", body: ["conversation": id, "keep": keep]) }
+    }
+    func deleteTurn(id: String, index: Int) async {
+        if !isFixture { await postVoid("conversation/delete_turn", body: ["conversation": id, "index": index]) }
+    }
     func deleteConversation(id: String) async {
         if !isFixture { await postVoid("conversation/delete", body: ["id": id]) }
     }
@@ -125,9 +141,13 @@ struct MentatClient: Sendable {
 
     // MARK: ask / command
 
-    func ask(question: String) async throws -> AskResponse {
+    func ask(question: String, conversation: String = "",
+             attachments: [ChatAttachment] = []) async throws -> AskResponse {
         if isFixture { return Fixtures.ask }
-        return try await post("ask", body: ["question": question])
+        return try await post("ask", body: [
+            "question": question, "conversation": conversation,
+            "attachments": attachments.map { ["path": $0.path, "name": $0.name] },
+        ])
     }
 
     /// Resolve a citation back to its verbatim source window for the reader.
@@ -167,7 +187,8 @@ struct MentatClient: Sendable {
 
     /// The `/ask/stream` line protocol as a typed event stream. Cancelling the
     /// consumer cancels the underlying request.
-    func streamEvents(question: String) -> AsyncThrowingStream<StreamEvent, Error> {
+    func streamEvents(question: String, conversation: String = "",
+                      attachments: [ChatAttachment] = []) -> AsyncThrowingStream<StreamEvent, Error> {
         if isFixture { return Fixtures.stream(question: question) }
         return AsyncThrowingStream { continuation in
             let task = Task {
@@ -175,8 +196,11 @@ struct MentatClient: Sendable {
                     var req = URLRequest(url: url("ask/stream"))
                     req.httpMethod = "POST"
                     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                    req.httpBody = try JSONSerialization.data(withJSONObject: ["question": question]
-                    )
+                    req.httpBody = try JSONSerialization.data(
+                        withJSONObject: [
+                            "question": question, "conversation": conversation,
+                            "attachments": attachments.map { ["path": $0.path, "name": $0.name] },
+                        ])
                     req.timeoutInterval = 1800
                     let (bytes, response) = try await session.bytes(for: req)
                     guard (response as? HTTPURLResponse)?.statusCode == 200 else {
@@ -255,6 +279,7 @@ enum Fixtures {
         citations: [Citation(book: "Dune", loc: "Chapter 1")],
         ungrounded: 0,
         model: "fixture",
+        conversation: nil,
         meta: AnswerMeta(
             kind: "quotes", t_thinking: 0.1,
             t_content: 0.2, tokens_in: 10,
@@ -302,7 +327,7 @@ enum Fixtures {
                         StreamEvent(
                             t: "chunk", v: "\(piece) ", answer: nil,
                             citations: nil, ungrounded: nil, model: nil,
-                            status: nil, meta: nil))
+                            status: nil, conversation: nil, meta: nil))
                     try? await Task.sleep(nanoseconds: 12_000_000)
                 }
                 continuation.yield(
@@ -310,6 +335,7 @@ enum Fixtures {
                         t: "done", v: nil, answer: answer,
                         citations: [Citation(book: "Dune", loc: "Chapter 1")],
                         ungrounded: 0, model: "fixture", status: "ok",
+                        conversation: nil,
                         meta: AnswerMeta(
                             kind: "quotes", t_thinking: 0.1,
                             t_content: 0.2, tokens_in: 10,

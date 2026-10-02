@@ -9,6 +9,11 @@ try! FileManager.default.createDirectory(at: outDir, withIntermediateDirectories
 
 let gold = NSColor(calibratedRed: 0.98, green: 0.82, blue: 0.52, alpha: 1)
 let spiceGlow = NSColor(calibratedRed: 0.95, green: 0.62, blue: 0.30, alpha: 0.75)
+// Eyes of Ibad — blue within blue: blue sclera + iris, and the pupil the
+// darkest blue (the symbol's centre is a hole, so the pupil is drawn).
+let eyeSclera = NSColor(calibratedRed: 0.34, green: 0.62, blue: 0.96, alpha: 1)
+let eyeIris = NSColor(calibratedRed: 0.18, green: 0.42, blue: 0.86, alpha: 1)
+let eyePupil = NSColor(calibratedRed: 0.04, green: 0.12, blue: 0.50, alpha: 1)
 
 func render(_ px: Int) -> Data {
     let rep = NSBitmapImageRep(
@@ -32,28 +37,33 @@ func render(_ px: Int) -> Data {
     // warm dune glow rising from below
     NSGraphicsContext.saveGraphicsState()
     path.addClip()
-    let glowRect = NSRect(x: inset - f * 0.1, y: -f * 0.35, width: f * 1.2, height: f * 1.0)
+    let glowRect = NSRect(x: inset - f * 0.1, y: -f * 0.35, width: f * 1.2, height: f * 0.90)
     NSGradient(colors: [spiceGlow, spiceGlow.withAlphaComponent(0.0)])?
         .draw(in: glowRect, relativeCenterPosition: NSPoint(x: 0, y: 0))
     NSGraphicsContext.restoreGraphicsState()
 
-    // glassy top highlight
+    // glassy top highlight (seam sits just above the vertical middle)
     NSGraphicsContext.saveGraphicsState()
     path.addClip()
     NSGradient(colors: [NSColor.white.withAlphaComponent(0.22), NSColor.white.withAlphaComponent(0.0)])?
-        .draw(in: NSRect(x: inset, y: f * 0.5, width: f, height: f * 0.5), angle: -90)
+        .draw(in: NSRect(x: inset, y: f * 0.44, width: f, height: f * 0.56), angle: -90)
     NSGraphicsContext.restoreGraphicsState()
 
-    // eye sigil
+    // eye sigil — eyes of ibad (blue within blue)
     if let sym = NSImage(systemSymbolName: "eye.fill", accessibilityDescription: nil) {
         let sizeCfg = NSImage.SymbolConfiguration(pointSize: f * 0.5, weight: .regular)
-        let colorCfg = NSImage.SymbolConfiguration(paletteColors: [gold])
+        let colorCfg = NSImage.SymbolConfiguration(paletteColors: [eyeSclera, eyeIris])
         if let s = sym.withSymbolConfiguration(sizeCfg.applying(colorCfg)) {
             let sz = s.size
             let scale = min(f * 0.60 / sz.width, f * 0.60 / sz.height)
             let w = sz.width * scale, h = sz.height * scale
             s.draw(in: NSRect(x: (f - w) / 2, y: (f - h) / 2, width: w, height: h),
                    from: .zero, operation: .sourceOver, fraction: 1)
+            // the symbol's centre is a hole — draw the pupil: the darkest blue
+            let pr = f * 0.046
+            eyePupil.setFill()
+            NSBezierPath(ovalIn: NSRect(x: f / 2 - pr, y: f / 2 - pr,
+                                        width: pr * 2, height: pr * 2)).fill()
         }
     }
 

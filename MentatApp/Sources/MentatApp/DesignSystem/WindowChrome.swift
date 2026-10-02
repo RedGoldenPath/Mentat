@@ -19,9 +19,17 @@ struct HideTrafficLights: NSViewRepresentable {
         }
 
         func apply() {
-            guard let window else { return }
-            for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
-                window.standardWindowButton(type)?.isHidden = true
+            // Defer to the next runloop and only mutate when it actually changes:
+            // toggling a window button *during* a layout pass (viewDidMoveToWindow
+            // / updateNSView) made AppKit throw from `_NSViewUpdateConstraints`,
+            // which surfaces as an EXC_BREAKPOINT crash (`_crashOnException`).
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let window = self.window else { return }
+                for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+                    if let button = window.standardWindowButton(type), !button.isHidden {
+                        button.isHidden = true
+                    }
+                }
             }
         }
     }

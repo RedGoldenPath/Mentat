@@ -3,20 +3,12 @@ import AppKit
 import CoreImage
 import CoreText
 import Observation
+import UniformTypeIdentifiers
 
 // MARK: - Wire models
 // Wire + chat models (Citation, AnswerMeta, AskResponse, StreamEvent,
 // Conversation, LibraryBook, DocBlock, SettingSpec, ChatRole, ChatMessage,
 // PageTurn) now live in Engine/Models.swift.
-
-/// A rounded rectangle that nests concentrically with its container (Apple's
-/// "concentric corners" guidance).
-struct NestedShape: Shape {
-    var radius: CGFloat
-    func path(in rect: CGRect) -> Path {
-        ConcentricRectangle().path(in: rect)
-    }
-}
 
 // SettingSpec + ChatRole moved to Engine/Models.swift.
 
@@ -50,12 +42,6 @@ extension AnyTransition {
 /// Which part of the background a view sits over (for adaptive text colour).
 enum BgRegion { case left, center, right }
 
-/// A sampled patch of the background: brightness + busyness (variance).
-struct BgCell {
-    let lum: CGFloat
-    let variance: CGFloat
-}
-
 // ChatMessage moved to Engine/Models.swift.
 
 // PageTurn moved to Engine/Models.swift.
@@ -78,176 +64,12 @@ struct ScrollEdgeEffect: ViewModifier {
     }
 }
 
-// MARK: - Background analysis
-
-/// Reads the chosen photo so the UI can pick complementary, quiet colours.
-/// Small colour-theory toolkit shared by every palette. The rule is
-/// **luminance first, then hue**: decide whether the art reads light or dark
-/// (that governs text value), then whether its colour is *warm* or *cool*
-/// (that governs the UI hue — a warm photo gets a cool-leaning palette and
-/// vice-versa, while surfaces stay in the art's own temperature family so they
-/// feel cohesive rather than pasted on).
-enum ColorTheory {
-    enum Temperature { case warm, cool, neutral }
-
-    /// Perceptual (Rec. 709) luminance, 0…1.
-    static func luminance(_ color: NSColor) -> CGFloat {
-        let c = color.usingColorSpace(.deviceRGB) ?? .darkGray
-        return 0.2126 * c.redComponent + 0.7152 * c.greenComponent + 0.0722 * c.blueComponent
-    }
-    static func isLight(_ color: NSColor) -> Bool { luminance(color) >= 0.5 }
-
-    static func hsb(_ color: NSColor) -> (h: CGFloat, s: CGFloat, b: CGFloat) {
-        let c = color.usingColorSpace(.deviceRGB) ?? .darkGray
-        var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
-        c.getHue(&h, saturation: &s, brightness: &b, alpha: &a)
-        return (h, s, b)
-    }
-
-    /// Warm = reds/oranges/yellows (hue < 65° or > 320°); cool = green→purple.
-    /// Near-greys carry no temperature.
-    static func temperature(_ color: NSColor) -> Temperature {
-        let (h, s, _) = hsb(color)
-        guard s > 0.12 else { return .neutral }
-        let deg = h * 360
-        return (deg < 65 || deg > 320) ? .warm : .cool
-    }
-    static func isWarm(_ color: NSColor) -> Bool { temperature(color) == .warm }
-
-    /// Nearest hue of the *opposite* temperature (≈ the complement): the UI
-    /// answers a warm photo with a cool accent and vice-versa.
-    static func contrastingHue(_ color: NSColor) -> CGFloat {
-        (hsb(color).h + 0.5).truncatingRemainder(dividingBy: 1)
-    }
-    /// A neighbouring hue that stays inside the art's own temperature family.
-    static func adjacentHue(_ color: NSColor) -> CGFloat {
-        (hsb(color).h + 0.083).truncatingRemainder(dividingBy: 1)   // +30°
-    }
-}
-
-
-/// Colour-grades the bundled desert photo for each mode.
-struct DesertGrade: ViewModifier {
-    let theme: AppTheme
-    func body(content: Content) -> some View {
-        switch theme {
-        case .hue:
-            content.contrast(1.12).saturation(1.14)
-        case .mono:
-            content.grayscale(1.0).contrast(1.45).brightness(0.02)   // punchy B&W
-        }
-    }
-}
-
-/// Photo background (Pexels / Pixabay) with mode grading and soft scrims so the
-/// floating chrome stays readable. The art is panned vertically so its calmest
-/// band sits behind the wordmark.
-struct DesertBackground: View {
-    @Environment(\.palette) private var pal
-    @Environment(\.appTheme) private var theme
-    var name: String = ""
-    /// Normalized y of the calm band in the source art (top-origin).
-    var quietY: CGFloat = 0.4
-    /// Decoded artwork size (aspect preserved), for the pan maths.
-    var imageSize: CGSize = .zero
-
-    var body: some View {
-        GeometryReader { geo in
-            let fw = geo.size.width, fh = geo.size.height
-            let dy = panOffset(frame: CGSize(width: fw, height: fh))
-            ZStack {
-                Group {
-                    if let img = NSImage(named: name), !name.isEmpty {
-                        Color.clear
-                            .frame(width: fw, height: fh)
-                            .overlay(
-                                Image(nsImage: img)
-                                    .resizable()
-                                    .scaledToFill()
-                                    .modifier(DesertGrade(theme: theme))
-                                    .offset(y: dy)
-                            )
-                            .clipped()
-                    } else {
-                        LinearGradient(colors: [pal.bg2, pal.bg],
-                                       startPoint: .top, endPoint: .bottom)
-                            .frame(width: fw, height: fh)
-                    }
-                }
-                scrims
-            }
-        }
-        .ignoresSafeArea()
-    }
-
-    /// Vertical shift so the image's quiet band lands ~40% down the frame (the
-    /// resting wordmark), clamped so the photo still covers the whole view.
-    private func panOffset(frame: CGSize) -> CGFloat {
-        let iw = imageSize.width, ih = imageSize.height
-        guard iw > 1, ih > 1, frame.width > 1, frame.height > 1 else { return 0 }
-        let scale = max(frame.width / iw, frame.height / ih)
-        return BackgroundAnalysis.panY(frameH: frame.height, dispH: ih * scale, quietY: quietY)
-    }
-
-    /// No top or bottom bars — everything floats straight on the photo.
-    /// Only a soft cinematic vignette remains.
-    private var scrims: some View {
-        RadialGradient(colors: [.clear, Color.black.opacity(theme == .hue ? 0.16 : 0.45)],
-                       center: .center, startRadius: 200, endRadius: 1100)
-            .allowsHitTesting(false)
-    }
-}
-
-/// Renders the *continuation* of the page artwork beneath the history sidebar:
-/// the same photo at the same scale and pan as the detail column, shifted so the
-/// slice belonging to the left of the sidebar lines up seamlessly. The sidebar's
-/// Liquid Glass sits on top, so the image reads edge-to-edge under the glass
-/// instead of the column sitting on a solid fill.
-struct SidebarArtwork: View {
-    @Environment(\.appTheme) private var theme
-    var name: String
-    var quietY: CGFloat
-    var imageSize: CGSize
-    /// Width of the detail column (its art's frame), in points.
-    var artWidth: CGFloat
-
-    var body: some View {
-        GeometryReader { geo in
-            let sw = geo.size.width, h = geo.size.height
-            let iw = imageSize.width, ih = imageSize.height
-            let W = artWidth > 1 ? artWidth : sw
-            Group {
-                if let img = NSImage(named: name), !name.isEmpty, iw > 1, ih > 1, h > 1 {
-                    let scale = max(W / iw, h / ih)
-                    let dw = iw * scale, dh = ih * scale
-                    let dy = BackgroundAnalysis.panY(frameH: h, dispH: dh, quietY: quietY)
-                    Image(nsImage: img)
-                        .resizable()
-                        .scaledToFill()
-                        .frame(width: dw, height: dh)
-                        .modifier(DesertGrade(theme: theme))
-                        // centre the photo where the detail column centres it,
-                        // then let the sidebar frame clip out its left slice
-                        .offset(x: (sw + W) / 2 - sw / 2, y: dy)
-                        .frame(width: sw, height: h)
-                        .clipped()
-                } else {
-                    Color.clear
-                }
-            }
-            .frame(width: sw, height: h)
-        }
-        .ignoresSafeArea()
-        .allowsHitTesting(false)
-    }
-}
-
 // MARK: - Engine
 
 @MainActor
 // Engine moved to Engine/Engine.swift.
 
-// Command catalog moved to Screens/Menu/CommandItem.swift.
+// Command catalog moved to Commands/Command.swift (the one registry).
 
 // Typography (TextStyle / TextLayout) lives in DesignSystem/Typography.swift.
 
@@ -297,29 +119,16 @@ struct MessageRow: View {
     @Environment(\.palette) private var pal
     @Environment(\.design) private var design
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var expanded = false
+    @Environment(InspectorStore.self) private var inspectorStore: InspectorStore?
     @State private var lastCount = 0
     @State private var bubbleAnim: Animation = Anim.smooth
-    /// Stable legibility backing for a region — never zero, so text is always
-    /// readable; the strength scales with how mid-toned (low-contrast) it is.
-    /// Noir keeps every bubble dark regardless of how bright the photo is;
-    /// Light adapts to the artwork behind it.
-    private func scrim(_ r: BgRegion, strength: Double = 1) -> some View {
-        let base = engine.scrimOpacity(r)
-        // Stained glass: the plate is the theme surface (hued), one surface for
-        // the whole page rather than a per-region neutral plate.
-        return RoundedRectangle(cornerRadius: design.composition.bubbleCorner, style: .continuous)
-            .fill(engine.colorTheme.surface.opacity(base * strength))
-    }
-
-    /// Body ink for a bubble: light on Noir's dark bubbles, otherwise sampled
-    /// from the photo so it always contrasts.
-    private func bubbleInk(_ r: BgRegion) -> Color {
-        pal.isDark ? Color(white: 0.95) : engine.text(r)
-    }
-    private func bubbleDim(_ r: BgRegion) -> Color {
-        pal.isDark ? Color(white: 0.68) : engine.dim(r)
-    }
+    @State private var hover = false
+    @FocusState private var editFocused: Bool
+    /// Content ink comes from the surface palette's on-roles — legible by
+    /// construction. (The image-driven `Legibility` resolver is now reserved for
+    /// the optional artwork accent behind the sidebar / hero.)
+    private func bubbleInk(_ r: BgRegion) -> Color { pal.text }
+    private func bubbleDim(_ r: BgRegion) -> Color { pal.textDim }
 
     private func trackText(_ text: String) {
         let delta = abs(text.count - lastCount)
@@ -330,21 +139,18 @@ struct MessageRow: View {
     /// Header band that lives *inside* each bubble: role name + glyph, ruled off
     /// from the body by a hairline, so the body reads as its own section rather
     /// than raw padding. Natural width, so a hugging bubble stays hugged.
-    private func roleHeader(_ name: String, symbol: String, region: BgRegion) -> some View {
+    private func roleHeader(
+        _ name: String, symbol: String, region: BgRegion, active: Bool = false
+    ) -> some View {
         HStack(spacing: 6) {
-            Image(systemName: symbol).font(.system(size: TypeScale.micro, weight: .bold))
+            Image(systemName: symbol)
+                .font(.system(size: TypeScale.micro, weight: .bold))
+                // Apple's "working" cue: the glyph breathes while the answer
+                // streams, so the bubble feels alive without a spinner.
+                .symbolEffect(.pulse, options: .repeating, isActive: active)
             Text(name).font(.system(size: TypeScale.caption, weight: .semibold)).tracking(0.7)
         }
         .foregroundStyle(bubbleDim(region))
-    }
-
-    /// Hairline under the header band, spanning the bubble (drawn as an overlay
-    /// so it never widens a bubble that hugs its text).
-    private func headerRule(_ region: BgRegion) -> some View {
-        Rectangle()
-            .fill(bubbleDim(region).opacity(0.22))
-            .frame(height: 0.75)
-            .padding(.top, 35)
     }
 
     /// Strip inline markdown markers for the cheap streaming preview; the
@@ -368,16 +174,31 @@ struct MessageRow: View {
             Spacer(minLength: 0)
             VStack(alignment: .trailing, spacing: 0) {
                 roleHeader("you", symbol: "person.fill", region: .right)
-                BookText(text: message.text,
-                         color: bubbleInk(.right).opacity(0.92),
-                         onTap: { engine.center(message.id) })
-                    .padding(.top, design.composition.roleHeaderTop)
-                if message.pendingQuestion != nil {
-                    HStack(spacing: 8) {
-                        ActionButton(system: "arrow.clockwise", help: "Edit & re-ask") { engine.reAsk(message.id) }
-                        ActionButton(system: "doc.on.doc", help: "Copy") { copyToPasteboard(message.text) }
+                if !message.attachmentNames.isEmpty {
+                    VStack(alignment: .trailing, spacing: 2) {
+                        ForEach(message.attachmentNames, id: \.self) { n in
+                            HStack(spacing: 4) {
+                                Image(systemName: "doc.text")
+                                Text(n).lineLimit(1)
+                            }
+                            .font(.system(size: TypeScale.meta))
+                            .foregroundStyle(bubbleDim(.right))
+                        }
                     }
-                    .padding(.top, 11)
+                    .padding(.top, 6)
+                }
+                if engine.editingID == message.id {
+                    editField
+                        .padding(.top, design.composition.roleHeaderTop)
+                } else {
+                    BookText(text: message.text,
+                             color: bubbleInk(.right).opacity(0.92),
+                             ink: engine.textInk,
+                             onTap: { engine.center(message.id) })
+                        .padding(.top, design.composition.roleHeaderTop)
+                    messageActions(isUser: true)
+                        .padding(.top, 11)
+                        .opacity(hover ? 1 : 0)
                 }
             }
             .padding(.horizontal, design.composition.bubblePaddingH)
@@ -385,22 +206,72 @@ struct MessageRow: View {
             .padding(.bottom, design.composition.bubblePaddingBottom)
             // a lighter, region-tinted backing so the reader's own words read as
             // a distinct, brighter note against the darker "mentat" answers
+            // a subtle raised surface — the reader's own note, not a card
             .background {
-                ZStack {
-                    scrim(.right, strength: 0.8)
-                    RoundedRectangle(cornerRadius: design.composition.bubbleCorner, style: .continuous)
-                        .fill(pal.isDark ? Color.white.opacity(0.05) : engine.tint(.right))
-                }
+                RoundedRectangle(cornerRadius: design.composition.bubbleCorner, style: .continuous)
+                    .fill(pal.bg2.opacity(pal.isDark ? 0.85 : 0.75))
             }
-            // one legibility plate for the content — no stacked glass on top
-            .overlay(alignment: .top) { headerRule(.right) }
             .onTapGesture { engine.center(message.id) }
+            .onHover { hover = $0 }
             .accessibilityElement(children: .contain)
             Spacer(minLength: 0)
         }
         .animation(reduceMotion ? nil : bubbleAnim, value: message.text)
         .onAppear { lastCount = message.text.count }
         .onChange(of: message.text) { _, t in trackText(t) }
+    }
+
+    /// Hover-revealed per-message actions. User messages can be edited/deleted
+    /// (deleting removes the answer too); the bot's turns can only be regenerated
+    /// or copied — matching ChatGPT/DeepSeek/Claude, and avoiding turn-index drift.
+    private func messageActions(isUser: Bool) -> some View {
+        HStack(spacing: 8) {
+            if isUser {
+                ActionButton(system: "pencil", help: "Edit") { engine.beginEdit(message.id) }
+                ActionButton(system: "doc.on.doc", help: "Copy") { copyToPasteboard(message.text) }
+                ActionButton(system: "trash", help: "Delete") {
+                    Task { await engine.deleteMessage(message.id) }
+                }
+            } else {
+                ActionButton(system: "arrow.clockwise", help: "Regenerate") {
+                    Task { await engine.regenerate(message.id) }
+                }
+                ActionButton(system: "doc.on.doc", help: "Copy") { copyToPasteboard(message.text) }
+            }
+        }
+    }
+
+    /// Inline editor shown while a user message is being edited (ChatGPT-style).
+    private var editField: some View {
+        let binding = Binding(get: { engine.editingText }, set: { engine.editingText = $0 })
+        return VStack(alignment: .trailing, spacing: 8) {
+            TextEditor(text: binding)
+                .font(.system(size: TextStyle.fontSize, design: .monospaced))
+                .foregroundStyle(bubbleInk(.right))
+                .scrollContentBackground(.hidden)
+                .frame(minWidth: 220, minHeight: 64)
+                .padding(6)
+                .background(bubbleInk(.right).opacity(0.06),
+                            in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(bubbleInk(.right).opacity(0.25), lineWidth: 1))
+                .focused($editFocused)
+            HStack(spacing: 8) {
+                Spacer(minLength: 0)
+                Button("Cancel") { engine.cancelEdit() }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(bubbleDim(.right))
+                Button("Save") {
+                    let t = engine.editingText
+                    Task { await engine.editMessage(message.id, to: t) }
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(engine.accentColor(.right))
+                .keyboardShortcut(.defaultAction)
+            }
+            .font(.system(size: TypeScale.caption, weight: .semibold))
+        }
+        .onAppear { editFocused = true }
     }
 
     private var assistant: some View {
@@ -416,17 +287,17 @@ struct MessageRow: View {
         VStack(alignment: .leading, spacing: 8) {
             // ---- the bubble itself ----
             VStack(alignment: .leading, spacing: 0) {
-                roleHeader("mentat", symbol: "sparkles", region: .left)
+                roleHeader("mentat", symbol: "sparkles", region: .left, active: message.streaming)
                 VStack(alignment: .leading, spacing: 8) {
                 if !message.reasoning.isEmpty {
                     DropdownRow(title: "Thoughts", count: nil, tint: bubbleDim(.left)) {
-                        // Same reading columns as the answer, at caption scale.
-                        ColumnText(
+                        // Same single column as the answer, at caption scale.
+                        ReadingColumn(
                             text: message.reasoning,
                             color: bubbleDim(.left),
                             availableWidth: textArea,
-                            fontSize: 11,
-                            showsPager: true)
+                            ink: engine.textInk,
+                            fontSize: 11)
                     }
                 }
 
@@ -449,39 +320,53 @@ struct MessageRow: View {
                     Text(message.progress.isEmpty ? "writing…" : message.progress)
                         .font(.caption).foregroundStyle(bubbleDim(.left))
                 } else {
-                    PagedText(text: message.text,
-                              color: message.failed ? pal.bad : bubbleInk(.left),
-                              availableWidth: textArea,
-                              messageID: message.id,
-                              turn: engine.pageTurn,
-                              onPage: { engine.center(message.id) },
-                              onTap: { engine.center(message.id) },
-                              onPages: { engine.setPageCount(message.id, $0) })
+                    ReadingColumn(text: message.text,
+                                  color: message.failed ? pal.bad : bubbleInk(.left),
+                                  availableWidth: textArea,
+                                  ink: engine.textInk,
+                                  onTap: {
+                                      engine.center(message.id)
+                                      inspectorStore?.focus(message.id)
+                                  })
                 }
 
                 HStack(spacing: 10) {
                     if message.streaming {
                         ActionButton(system: "stop.circle", help: "Stop") { engine.stop() }
                     } else if !message.text.isEmpty {
-                        ActionButton(system: "doc.on.doc", help: "Copy") { copyToPasteboard(message.text) }
+                        messageActions(isUser: false)
+                            .opacity(hover ? 1 : 0)
+                    }
+                }
+
+                // Generated views render inline, right under the answer — not only
+                // in the Inspector. Any `scene`/`genui` block a model (or the
+                // /scene command) emits shows up here through the element registry.
+                if !message.streaming {
+                    ForEach(
+                        Array(SceneParser.extract(from: message.text).enumerated()), id: \.offset
+                    ) { _, spec in
+                        SceneRenderer(spec: spec)
+                            .frame(maxWidth: TextStyle.maxMeasure(), alignment: .leading)
+                            .padding(.top, 2)
                     }
                 }
                 }
-                // two lines of breathing room between the "mentat" header and the
-                // answer body
-                .padding(.top, 40)
+                // a short beat between the "mentat" label and the answer body
+                .padding(.top, 18)
             }
             // roomier padding, with the header band inside so the role reads as a
             // header rather than a caption perched on the bubble's edge
             .padding(.horizontal, hPad)
             .padding(.top, design.composition.bubblePaddingTop)
             .padding(.bottom, design.composition.bubblePaddingBottom)
-            .background(scrim(.left))
-            // no stacked glass bubble: the scrim is the single content plate
-            .overlay(alignment: .top) { headerRule(.left) }
+            // plain prose in the reading column (Claude / Obsidian) — no card
             // clicking an answer keeps it centred so a page/reasoning animation
-            // can't carry it out of the viewport
-            .onTapGesture { engine.center(message.id) }
+            // can't carry it out of the viewport, and pins the Inspector to it
+            .onTapGesture {
+                engine.center(message.id)
+                inspectorStore?.focus(message.id)
+            }
             // hugs its content and grows outward from the centre
 
             // ---- citations float underneath the bubble ----
@@ -515,6 +400,7 @@ struct MessageRow: View {
         }
         // no spring while tokens stream in (20×/s would thrash layout); animate
         // the grow only once, or for the reader's own messages
+        .onHover { hover = $0 }
         .animation(message.streaming || reduceMotion ? nil : bubbleAnim, value: message.text)
         .onAppear { lastCount = message.text.count }
         .onChange(of: message.text) { _, t in trackText(t) }
@@ -529,9 +415,10 @@ struct MessageRow: View {
             .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(12)
-            // content layer: standard material, not Liquid Glass (per the HIG)
-            .background(.regularMaterial,
-                        in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            // content layer: the same bubble plate as the transcript
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(pal.bg2.opacity(0.45)))
     }
 
     private func metaLine(_ meta: AnswerMeta) -> String {
@@ -560,6 +447,7 @@ func copyToPasteboard(_ s: String) {
 struct ChatView: View {
     var engine: Engine
     var compact: Bool = false
+    @Environment(\.sandMotion) private var sandMotion
     @State private var question = ""
     @State private var showPalette = false
     @State private var showMenu = UserDefaults.standard.bool(forKey: "debugShowMenu")
@@ -567,23 +455,26 @@ struct ChatView: View {
         (UserDefaults.standard.string(forKey: "debugMenuPanel").flatMap { MenuPanel(rawValue: $0) })
     @State private var menuDetailH: CGFloat = 0
     @State private var composerH: CGFloat = 0
+    @State private var showImporter = false
+    @State private var dropTargeted = false
+    @State private var inputHeight: CGFloat = 38
 
     /// Which sub-panel the hamburger's icon rail has open.
     private enum MenuPanel: String, CaseIterable, Identifiable {
-        case background, palette, settings, command
+        case looks, sand, settings, command
         var id: String { rawValue }
         var symbol: String {
             switch self {
-            case .background: return "photo.on.rectangle.angled"
-            case .palette:    return "paintpalette"
+            case .looks:      return "paintbrush.pointed.fill"
+            case .sand:       return "mountain.2.fill"
             case .settings:   return "slider.horizontal.3"
             case .command:    return "command"
             }
         }
         var title: String {
             switch self {
-            case .background: return "Background"
-            case .palette:    return "Palette"
+            case .looks:      return "Looks"
+            case .sand:       return "Sand"
             case .settings:   return "Settings"
             case .command:    return "Command palette"
             }
@@ -591,11 +482,13 @@ struct ChatView: View {
     }
     @FocusState private var focused: Bool
     @Environment(\.palette) private var pal
-    @Environment(\.appTheme) private var theme
     @Environment(\.ink) private var ink
     @Environment(\.openWindow) private var openWindow
-    @AppStorage("sidebarVisible") private var sidebarVisible = true
+    @Environment(AppStore.self) private var appStore: AppStore?
     @Environment(DesignStore.self) private var designStore: DesignStore?
+    @Environment(InspectorStore.self) private var inspectorStore: InspectorStore?
+    @Environment(\.runUIAction) private var runUIAction
+    private var sidebarVisible: Bool { appStore?.state.sidebarVisible ?? true }
     private var showGrid: Bool { designStore?.tokens.inspector.showGrid ?? false }
     @AppStorage("gridMargin") private var gridMargin = 20.0
     @AppStorage("gridCols") private var gridCols = 9
@@ -603,17 +496,15 @@ struct ChatView: View {
     @AppStorage("gridRows") private var gridRows = 8
     @AppStorage("gridBaseline") private var gridBaseline = 12.0
     @AppStorage("headerHeight") private var headerHeight = 68.0
-    @AppStorage("appearance") private var appearanceRaw = AppTheme.fallback.rawValue
-    @AppStorage("shuffleBackgrounds") private var shuffleOnLaunch = false
     /// Global palette shift (degrees) — retints every UI colour at once.
     @AppStorage("paletteShift") private var paletteShift = 0.0
 
-    private var suggestions: [CommandItem] {
+    private var suggestions: [Command] {
         guard question.hasPrefix("/") else { return [] }
         let token = question.dropFirst()
         if token.contains(" ") { return [] }
-        return CommandItem.all(debug: engine.debugMode)
-            .filter { token.isEmpty || $0.cmd.hasPrefix(token.lowercased()) }
+        return CommandRegistry.all(debug: engine.debugMode)
+            .filter { $0.isSlash && (token.isEmpty || ($0.slash?.hasPrefix(token.lowercased()) ?? false)) }
     }
 
     var body: some View {
@@ -632,25 +523,19 @@ struct ChatView: View {
                 )
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .coordinateSpace(name: "mentat.window")
         .frame(minWidth: compact ? 400 : 640, minHeight: compact ? 360 : 520)
         .background(
             GeometryReader { g in
                 Color.clear
-                    .onAppear { engine.contentSize = g.size; engine.refreshBackgroundRegions() }
-                    // resizing changes the visible crop of the photo, so the
-                    // adaptive ink has to be recomputed against what's on screen
-                    .onChange(of: g.size) { _, s in engine.contentSize = s; engine.refreshBackgroundRegions() }
+                    .onAppear { engine.contentSize = g.size }
+                    .onChange(of: g.size) { _, s in engine.contentSize = s }
             }
         )
-        // the grid sits under the UI but over the art; it nudges down and grows a
-        // masthead band for the wordmark once you start typing, and always stops
-        // short of the composer (rounded + guttered) instead of clipping into it
-        .background {
-            // the grid runs from the page's top margin (up behind the wordmark,
-            // matching the top row of the layout grid) down to the top of the
-            // composer, leaving the model line + spacing as breathing room
-            GridLinesLayer(topInset: 0, bottomTrim: composerH)
-        }
+        // the titlebar band, so the grid clears the traffic lights (no clipping)
+        .background(TopInsetReader { engine.topInset = $0 })
+        // no column-feather grid behind the text: the chat reads as a plain
+        // single column, not a design armature.
         // arrow keys page the clicked answer (unless a text field is editing)
         .background(ArrowKeyMonitor(engine: engine))
         // overlays float ABOVE the page and never influence its layout
@@ -676,7 +561,7 @@ struct ChatView: View {
         // hidden power-user panel, revealed by /debug
         .overlay(alignment: .topTrailing) {
             if engine.debugMode && !compact {
-                DebugPanel(engine: engine) {
+                DeveloperScene(engine: engine) {
                     withAnimation(Anim.snappy) { engine.debugMode = false }
                 }
                 .padding(.top, 64)
@@ -685,16 +570,22 @@ struct ChatView: View {
                 .transition(.dropIn)
             }
         }
-        .animation(Anim.smooth, value: engine.bgTint)
-        .animation(Anim.smooth, value: engine.bgIsLight)
+        .animation(Anim.smooth, value: engine.colorTheme)
         .task {
             await engine.ensureEngine()
+            await engine.loadSettings()
             focused = true
         }
         .sheet(isPresented: $showPalette) {
-            CommandPalette(debugMode: engine.debugMode) { cmd in
+            CommandPalette(debugMode: engine.debugMode) { command in
                 showPalette = false
-                if cmd == "settings" { showMenu = true; menuPanel = .settings } else { question = "/\(cmd) "; focused = true }
+                switch command.kind {
+                case .ui(let action):
+                    runUIAction(action)
+                case .slash(let s):
+                    if s == "settings" { showMenu = true; menuPanel = .settings }
+                    else { question = "/\(s) "; focused = true }
+                }
             }
         }
         .background(
@@ -719,10 +610,6 @@ struct ChatView: View {
                 SourceReader(engine: engine)
             }
         }
-    }
-
-    private var shadowColor: Color {
-        engine.isLight(.center) ? Color.white.opacity(0.7) : Color.black.opacity(0.55)
     }
 
     private func chip(_ system: String, help: String, action: @escaping () -> Void) -> some View {
@@ -768,21 +655,15 @@ struct ChatView: View {
     /// Column nearest the page centre, so centred text lands on a column, never a gutter.
     private var middleColumn: Int { max(1, min(gridCols, Int((Double(gridCols) / 2).rounded()))) }
 
-    private var appearance: AppTheme { AppTheme(rawValue: appearanceRaw) ?? .fallback }
-    private func cycleTheme() { appearanceRaw = appearance.next.rawValue }
+    private var appearance: AppTheme { appStore?.appearance ?? .fallback }
+    private func cycleTheme() { runUIAction(.cycleAppearance) }
 
     /// Chrome palette for the right-hand rail + panels, sampled from the art
     /// behind them — the same language the history rail uses on the left.
     private var chrome: ChromePalette { ChromePalette(engine, .right) }
 
     private var menuSections: [(String, [SettingSpec])] {
-        var order: [String] = []; var map: [String: [SettingSpec]] = [:]
-        for s in engine.settingsSpec where SettingSpec.primaryKeys.contains(s.key) {
-            let sec = s.section ?? "Other"
-            if map[sec] == nil { order.append(sec); map[sec] = [] }
-            map[sec]?.append(s)
-        }
-        return order.map { ($0, map[$0] ?? []) }
+        SettingSection.group(engine.settingsSpec) { SettingSpec.primaryKeys.contains($0.key) }
     }
 
     private func menuRow(_ title: String, symbol: String, _ action: @escaping () -> Void) -> some View {
@@ -813,219 +694,6 @@ struct ChatView: View {
         .buttonStyle(.plain)
     }
 
-    /// Background gallery: opens inside the menu so a wallpaper can be chosen
-    /// without leaving the page. Live thumbnails, current one ringed in spice.
-    private var backgroundPicker: some View {
-        VStack(alignment: .leading, spacing: PanelGrid.gap(gridGutter)) {
-            HStack {
-                Text("BACKGROUNDS").font(.caption2).tracking(1).foregroundStyle(chrome.accent)
-                Spacer()
-                Button { engine.shuffleBackground() } label: {
-                    Label("Shuffle", systemImage: "shuffle")
-                }
-                .buttonStyle(.plain).foregroundStyle(chrome.accent).font(.caption2)
-            }
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 78), spacing: PanelGrid.gap(gridGutter) * 0.5)],
-                      spacing: PanelGrid.gap(gridGutter) * 0.5) {
-                ForEach(engine.backgrounds, id: \.self) { name in
-                    Button { engine.selectBackground(name) } label: {
-                        Color.clear
-                            .frame(height: 52)
-                            .frame(maxWidth: .infinity)
-                            .overlay(
-                                AsyncThumbnail(name: name)
-                                    .modifier(DesertGrade(theme: theme))
-                            )
-                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                    .strokeBorder(
-                                        engine.backgroundName == name ? chrome.accent : chrome.dim.opacity(0.25),
-                                        lineWidth: engine.backgroundName == name ? 2 : 1)
-                            )
-                    }
-                    .buttonStyle(.pressable)
-                }
-            }
-            Toggle("Shuffle on launch", isOn: $shuffleOnLaunch)
-                .font(.caption2).foregroundStyle(engine.text(.center))
-
-            // The OKLCH colour system: the roles resolved for the current image.
-            VStack(alignment: .leading, spacing: 6) {
-                Text("COLOUR SYSTEM").font(.caption2).tracking(1).foregroundStyle(chrome.accent)
-                PaletteSwatches(colors: [engine.colorTheme.background, engine.colorTheme.surface,
-                                         engine.colorTheme.accent, engine.colorTheme.ink,
-                                         engine.colorTheme.good, engine.colorTheme.bad],
-                                bigCount: 3, big: 22, small: 13)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .padding(.top, PanelGrid.gap(gridGutter) * 0.5)
-        }
-        .padding(.top, PanelGrid.gap(gridGutter) * 0.5)
-    }
-
-    /// The palette tool: OKLCH-native controls over the active colour system.
-    /// Hue follows the image; chroma and contrast tune the resolved, contrast-
-    /// enforced theme. No named schemes.
-    /// A small caption above a control, so the palette panel reads consistently
-    /// now that the pickers are glass capsules instead of system segmenteds.
-    @ViewBuilder private func labeledControl<Content: View>(
-        _ title: String, @ViewBuilder content: () -> Content
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title).font(.system(size: TypeScale.caption)).foregroundStyle(chrome.dim)
-            content()
-        }
-    }
-
-    private var palettePicker: some View {
-        let controls = engine.colorControls
-        let theme = engine.colorTheme
-        return VStack(alignment: .leading, spacing: PanelGrid.gap(gridGutter)) {
-            HStack {
-                Text("COLOUR SYSTEM").font(.caption2).tracking(1).foregroundStyle(chrome.accent)
-                Spacer()
-                Text(theme.isLight ? "light" : "dark")
-                    .font(.caption2).foregroundStyle(chrome.dim)
-            }
-            ColumnText(
-                text: "Hue follows the image. Contrast is enforced to WCAG.",
-                color: chrome.dim,
-                availableWidth: TextStyle.measure(chars: 40, size: 12),
-                fontSize: 12)
-            Text("image \(engine.imagePalette.isNeutral ? "neutral" : "\(Int(engine.imagePalette.baseHue))°") · base \(Int(theme.baseHue))°")
-                .font(.system(size: TypeScale.micro, design: .monospaced))
-                .foregroundStyle(chrome.dim)
-                .fixedSize(horizontal: false, vertical: true)
-
-            schemeList
-
-            themePreview(theme)
-
-            sliderRow("Hue", value: theme.baseHue, range: 0...360, suffix: "°") { v in
-                var c = controls
-                c.hueShift = v - engine.imagePalette.baseHue
-                engine.setColorControls(c)
-            }
-            sliderRow("Chroma", value: controls.chroma, range: 0...2, format: "%.2f") { v in
-                var c = controls; c.chroma = v; engine.setColorControls(c)
-            }
-            sliderRow("Contrast", value: controls.contrast, range: 0.6...1.8, format: "%.2f") { v in
-                var c = controls; c.contrast = v; engine.setColorControls(c)
-            }
-            sliderRow("Tint", value: controls.tintStrength, range: 0...2, format: "%.2f") { v in
-                var c = controls; c.tintStrength = v; engine.setColorControls(c)
-            }
-            Toggle("Follow image", isOn: Binding(
-                get: { controls.followImage },
-                set: { v in var c = controls; c.followImage = v; engine.setColorControls(c) }))
-                .font(.caption2)
-
-            labeledControl("Text ink") {
-                GlassSegmentedControl(
-                    options: [Engine.InkMode.background, .theme],
-                    label: { $0 == .background ? "Adaptive" : "Theme" },
-                    selection: Binding(
-                        get: { engine.inkMode }, set: { engine.setInkMode($0) }))
-            }
-
-            labeledControl("Glass") {
-                GlassSegmentedControl(
-                    options: [GlassStyle.tinted, .clear],
-                    label: { $0 == .tinted ? "Tinted" : "Clear" },
-                    selection: Binding(
-                        get: { engine.glassStyle }, set: { engine.setGlassStyle($0) }))
-            }
-
-            HStack(spacing: 8) {
-                Button("Reset") {
-                    var c = ColorControls.default
-                    c.light = controls.light
-                    c.monochrome = controls.monochrome
-                    engine.setColorControls(c)
-                }
-                .buttonStyle(.plain).foregroundStyle(chrome.accent).font(.caption2)
-                Spacer()
-                Text(engine.imagePalette.isNeutral ? "neutral image"
-                     : "image \(Int(engine.imagePalette.baseHue))°")
-                    .font(.caption2).foregroundStyle(chrome.dim)
-            }
-        }
-        .padding(.top, PanelGrid.gap(gridGutter) * 0.5)
-    }
-
-    /// A row of the theme's resolved roles, so the tool shows the actual result.
-    private func themePreview(_ theme: ColorTheme) -> some View {
-        HStack(spacing: 4) {
-            ForEach(Array([theme.background, theme.surface, theme.accent, theme.secondary,
-                           theme.tertiary, theme.ink, theme.good, theme.bad].enumerated()),
-                    id: \.offset) { _, c in
-                RoundedRectangle(cornerRadius: 5, style: .continuous)
-                    .fill(c)
-                    .frame(height: 26)
-            }
-        }
-    }
-
-    /// The scheme picker: one row per scheme with a live preview built from the
-    /// current image, tap to apply.
-    private var schemeList: some View {
-        VStack(spacing: 4) {
-            ForEach(PaletteScheme.allCases) { scheme in
-                schemeRow(scheme)
-            }
-        }
-    }
-
-    private func schemeRow(_ scheme: PaletteScheme) -> some View {
-        let t = engine.previewTheme(for: scheme)
-        let active = engine.colorControls.scheme == scheme
-        return Button {
-            var c = engine.colorControls
-            c.scheme = scheme
-            engine.setColorControls(c)
-        } label: {
-            HStack(spacing: 8) {
-                HStack(spacing: 3) {
-                    ForEach(Array([t.background, t.surface, t.accent,
-                                   t.secondary, t.tertiary, t.ink].enumerated()),
-                            id: \.offset) { i, c in
-                        RoundedRectangle(cornerRadius: 3, style: .continuous)
-                            .fill(c)
-                            .frame(width: i == 0 ? 20 : 12, height: 16)
-                    }
-                }
-                Text(scheme.label)
-                    .font(.system(size: 10.5, weight: .medium))
-                    .foregroundStyle(active ? chrome.accent : chrome.ink)
-                Spacer(minLength: 4)
-                if active {
-                    Image(systemName: "checkmark")
-                        .font(.system(size: TypeScale.micro, weight: .bold))
-                        .foregroundStyle(chrome.accent)
-                }
-            }
-            .padding(.horizontal, 8).padding(.vertical, 5)
-            .background(RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .fill(active ? chrome.accent.opacity(0.14) : Color.clear))
-            .contentShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func sliderRow(_ label: String, value: Double, range: ClosedRange<Double>,
-                           suffix: String = "", format: String = "%.0f",
-                           set: @escaping (Double) -> Void) -> some View {
-        HStack(spacing: 8) {
-            Text(label).font(.caption2).foregroundStyle(engine.text(.center))
-                .frame(width: 54, alignment: .leading)
-            Slider(value: Binding(get: { value }, set: set), in: range)
-            Text(String(format: format, value) + suffix)
-                .font(.caption2).foregroundStyle(engine.dim(.center))
-                .frame(width: 42, alignment: .trailing)
-        }
-    }
-
     /// The hamburger's menu: a thin rail of icons; tapping one opens that
     /// specific panel beside it, dropping down directly under the circle.
     private var floatingMenu: some View {
@@ -1047,8 +715,10 @@ struct ChatView: View {
             switch menuPanel {
             case .settings:
                 return min(max(2 * colW, 396), panelCap)
-            case .palette:
-                return min(max(2 * colW, 356), panelCap)
+            case .sand:
+                return min(max(2 * colW, 360), panelCap)
+            case .looks:
+                return min(max(2 * colW, 360), panelCap)
             default:
                 // one-line rows ("Command palette") need a little more room
                 // than the raw two-column width
@@ -1060,7 +730,7 @@ struct ChatView: View {
         // it keeps a comfortable inset from both edges
         let menuX = m + CGFloat(max(1, gridCols) - 1) * (colW + g) + colW / 2
         // drop just below the hamburger (top of R1, nudged down when activated)
-        let menuTop = activated ? bandCenterY(H) + 24 : rowTop(1, H) + 48
+        let menuTop = (activated ? bandCenterY(H) + 24 : rowTop(1, H) + 48) + engine.topInset
         let inset = max(m, 2 * g)
         let leading = min(max(inset, menuX - width / 2), max(inset, W - width - inset))
         let top = menuTop
@@ -1098,12 +768,23 @@ struct ChatView: View {
     }
 
     /// The vertical strip of icon buttons. Appearance is a one-tap toggle
-    /// (Hue ↔ Noir) rather than a panel — it only has two states.
+    /// (Hue ↔ Mono) rather than a panel — it only has two states.
     private var menuRail: some View {
         VStack(spacing: 6) {
+            // Inspector lives here now (folded out of the header): one tap toggles
+            // the trailing pane, highlighted while it's open.
+            CircleIconButton(
+                system: "wrench.and.screwdriver",
+                help: (inspectorStore?.visible ?? false) ? "Hide inspector" : "Show inspector",
+                diameter: ChromeShape.circle,
+                active: inspectorStore?.visible ?? false,
+                tint: railAccent
+            ) {
+                withAnimation(Anim.snappy) { inspectorStore?.toggle() }
+            }
             CircleIconButton(
                 system: "circle.lefthalf.filled",
-                help: "Appearance: \(appearance.label) — click to switch (Hue ↔ Noir)",
+                help: "Appearance: \(appearance.label) — click to switch (Hue ↔ Mono)",
                 diameter: ChromeShape.circle,
                 tint: railAccent
             ) {
@@ -1143,10 +824,10 @@ struct ChatView: View {
                         .font(.caption2).tracking(1).foregroundStyle(chrome.accent)
                 }
                 switch panel {
-                case .background:
-                    backgroundPicker
-                case .palette:
-                    palettePicker
+                case .looks:
+                    DesignStudioPanel()
+                case .sand:
+                    SandPanel()
                 case .settings:
                     settingsSections
                 case .command:
@@ -1204,9 +885,11 @@ struct ChatView: View {
         activated ? wordmarkBandH + 2 * CGFloat(gridBaseline) : 0
     }
     /// Absolute y (from the top of the page) of the grid's top edge.
-    private var gridTopInset: CGFloat { CGFloat(gridMargin) + gridContentInset }
+    private var gridTopInset: CGFloat {
+        engine.topInset + CGFloat(gridMargin) + gridContentInset
+    }
     /// Bottom edge of the title/masthead row, in page coordinates.
-    private var titleBottomY: CGFloat { CGFloat(gridMargin) + wordmarkBandH }
+    private var titleBottomY: CGFloat { engine.topInset + CGFloat(gridMargin) + wordmarkBandH }
     /// Height of the masthead grid row that holds the wordmark + menu buttons.
     private let wordmarkBandH: CGFloat = 56
     /// Vertical centre of that masthead row, in layer coordinates.
@@ -1227,37 +910,14 @@ struct ChatView: View {
         return m + CGFloat(k - 1) * (rowH + CGFloat(gridGutter)) + rowH / 2
     }
 
-    /// One-line model + running dot, floated at the bottom-left of the page.
-    private var modelLine: some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(engine.busy ? pal.good : (engine.online ? ink(.center).opacity(0.7) : engine.accentColor(.center)))
-                .frame(width: 7, height: 7)
-                .shadow(color: shadowColor, radius: 3)
-            Text(engine.model)
-                .font(.system(size: TypeScale.caption, weight: .semibold, design: .monospaced))
-                .foregroundStyle(ink(.center))
-                .lineLimit(1)
-                .fixedSize()
-        }
-        .fixedSize()
-        // a small Liquid Glass pill so the model name reads cleanly on the art
-        .padding(.horizontal, 9).padding(.vertical, 4)
-        .liquid(corner: 11, interactive: true)
-        .shadow(color: shadowColor.opacity(0.5), radius: 2, y: 1)
-    }
+    /// The floating chrome is **white**: a plain white ring/glyph at rest, and a
+    /// white fill with a black glyph when active. No sampled ink — the surface
+    /// system owns legibility, so these read the same in every look.
+    private func discFill(_ region: BgRegion) -> Color { .white }
+    private func discContent(_ region: BgRegion) -> Color { .black }
 
-    /// Header disc colours: adaptive black/white sampled from the photo.
-    private func discFill(_ region: BgRegion) -> Color { ink(region) }
-    private func discContent(_ region: BgRegion) -> Color {
-        // Contrast the disc's own fill (the adaptive ink), so the glyph never
-        // vanishes when the art behind the control is dark.
-        let lum = ColorScience.relativeLuminance(NSColor(ink(region)))
-        return lum > 0.5 ? Color.black : Color.white
-    }
-
-    /// The rail's active/ink colours: adaptive ink sampled from the photo.
-    private var railAccent: Color { ink(.right) }
+    /// The rail's accent is white too.
+    private var railAccent: Color { .white }
     private var railInk: Color { chrome.ink }
 
     private var menuCircle: some View {
@@ -1274,7 +934,6 @@ struct ChatView: View {
                 .foregroundStyle(on ? content : fill)
         }
         .frame(width: 26, height: 26)
-        .shadow(color: shadowColor.opacity(0.6), radius: 3, y: 1)
         // larger hit target than the visible circle so direct clicks always land
         .frame(width: 40, height: 40)
         .contentShape(Circle())
@@ -1294,28 +953,25 @@ struct ChatView: View {
             let gm = CGFloat(gridMargin), gg = CGFloat(gridGutter), gn = max(1, gridCols)
             let contentW = max(200, W - 2 * gm)
             let colW = max(2, (contentW - gg * CGFloat(gn - 1)) / CGFloat(gn))
-            let titleTop = activated ? rowTop(1, H) : rowTop(4, H)
-            let btnTop = activated ? bandCenterY(H) - 20 : rowTop(1, H)
+            let titleTop = (activated ? rowTop(1, H) : rowTop(4, H)) + engine.topInset
+            let btnTop = (activated ? bandCenterY(H) - 20 : rowTop(1, H)) + engine.topInset
             let menuX = gm + CGFloat(gn - 1) * (colW + gg) + colW / 2
             let sidebarX = gm + colW / 2
             let titleInk = activated ? ink.top : ink(.center)
-            // Soft opposite-tone shadow guarantees separation if the art behind
-            // is mid-tone — no outline, just a gentle halo.
-            let titleIsLight = ColorScience.relativeLuminance(NSColor(titleInk)) > 0.5
-            let titleShadow = titleIsLight ? Color.black.opacity(0.45) : Color.white.opacity(0.5)
+            // No halo/glow: the wordmark is brand sand, the subtitle takes the
+            // adaptive ink. Separation comes from the surface, never a shadow.
             ZStack(alignment: .topLeading) {
                 VStack(spacing: 12) {
                     Text("mentat")
                         .font(.custom("Quicksand-Light", size: 46))
                         .tracking(14)
-                        .foregroundStyle(titleInk)
+                        .foregroundStyle(Color(nsColor: TextInk.brandMark(isLight: engine.colorTheme.isLight)))
                     Text("what wisdom do you seek?")
                         .font(.system(size: 15, design: .monospaced))
                         .foregroundStyle(titleInk)
                         .opacity(activated ? 0 : 1)
                 }
                 .fixedSize()
-                .shadow(color: titleShadow, radius: 16, y: 2)
                 .frame(maxWidth: .infinity, alignment: .center)
                 .offset(y: titleTop)
                 .allowsHitTesting(false)
@@ -1336,7 +992,7 @@ struct ChatView: View {
         let content = discContent(.left)
         let on = sidebarVisible
         return ZStack {
-            // thin ring; fills with the palette colour (Hue) or black/white (Noir)
+            // thin ring; fills with the palette colour (Hue) or black/white (Sand)
             Circle().fill(on ? fill : Color.clear)
             Circle().stroke(fill.opacity(on ? 0.9 : 0.55), lineWidth: 1)
             Image(systemName: "sidebar.left")
@@ -1344,14 +1000,13 @@ struct ChatView: View {
                 .foregroundStyle(on ? content : fill)
         }
         .frame(width: 26, height: 26)
-        .shadow(color: shadowColor.opacity(0.6), radius: 3, y: 1)
         // match the hamburger circle's 40pt hit frame so the two toggles
         // share the exact same vertical centre
         .frame(width: 40, height: 40)
         .contentShape(Circle())
         .scaleEffect(on ? 1.05 : 1)
         .animation(Anim.snappy, value: on)
-        .onTapGesture { withAnimation(Anim.snappy) { sidebarVisible.toggle() } }
+        .onTapGesture { runUIAction(.toggleSidebar) }
         .help(sidebarVisible ? "Hide history" : "Show history")
         .accessibilityLabel(sidebarVisible ? "Hide history" : "Show history")
     }
@@ -1421,12 +1076,20 @@ struct ChatView: View {
                     .init(color: .black.opacity(0), location: 1)
                 ], startPoint: .top, endPoint: .bottom)
             )
-            // follow the newest turn, but defer to the next runloop so a just
+            // Pin to the bottom while content streams: the modern anchor follows
+            // growth without us scrolling on every token (the old per-token
+            // scrollTo was the main streaming stutter). Apple "SwiftUI — Scroll
+            // views: defaultScrollAnchor".
+            .defaultScrollAnchor(.bottom)
+            // Reading imparts a light shear, proportional to the flick. The
+            // threshold keeps it to real movements, not jitter.
+            .onScrollGeometryChange(for: CGFloat.self) { $0.contentOffset.y } action: { old, new in
+                let dy = new - old
+                if abs(dy) > 2 { sandMotion?.emit(.scroll(dy: Double(dy))) }
+            }
+            // Jump on a new turn, but defer to the next runloop so a just
             // appended turn is laid out before we scroll to it (scrolling in
             // the same update silently no-ops and the answer lands off-screen)
-            .onChange(of: engine.messages.last?.text) { _, _ in
-                DispatchQueue.main.async { proxy.scrollTo("bottom", anchor: .bottom) }
-            }
             .onChange(of: engine.messages.count) { _, _ in
                 DispatchQueue.main.async {
                     withAnimation(Anim.smooth) { proxy.scrollTo("bottom", anchor: .bottom) }
@@ -1453,11 +1116,11 @@ struct ChatView: View {
         VStack(alignment: .leading, spacing: 0) {
             ForEach(suggestions.prefix(8)) { item in
                 Button {
-                    question = "/\(item.cmd) "
+                    question = "/\(item.slash ?? "") "
                     focused = true
                 } label: {
                     HStack {
-                        Text("/\(item.cmd)").foregroundStyle(engine.accentColor(.center)).frame(width: 110, alignment: .leading)
+                        Text("/\(item.slash ?? "")").foregroundStyle(engine.accentColor(.center)).frame(width: 110, alignment: .leading)
                         Text(item.help).foregroundStyle(pal.textDim)
                         Spacer()
                     }
@@ -1467,7 +1130,7 @@ struct ChatView: View {
                 .buttonStyle(.pressable)
             }
         }
-        .liquid(corner: PanelGrid.radius(gridGutter))
+        .surface(corner: PanelGrid.radius(gridGutter))
         .glassMaterialize()
         .padding(.horizontal, compact ? 12 : CGFloat(gridMargin))
     }
@@ -1485,7 +1148,7 @@ struct ChatView: View {
         .font(.caption)
         .foregroundStyle(engine.dim(.center))
         .padding(.horizontal, 12).padding(.vertical, 8)
-        .background(.ultraThinMaterial, in: Capsule(style: .continuous))
+        .surface(shape: Capsule(style: .continuous))
         .padding(.horizontal, 16).padding(.bottom, 6)
         .transition(.move(edge: .bottom).combined(with: .opacity))
     }
@@ -1493,55 +1156,122 @@ struct ChatView: View {
     private var composer: some View {
         VStack(alignment: .leading, spacing: 6) {
             if !compact && !engine.model.isEmpty {
-                modelLine.allowsHitTesting(false)
+                ModelPicker(engine: engine)
             }
-            TextField("ask mentat…  (/help · \"count <word>\" or /freq to count)", text: $question, axis: .vertical)
-                .textFieldStyle(.plain)
-                .lineLimit(1...10)
-                .padding(PanelGrid.row(gridGutter))
-                .padding(.trailing, 52)
-                // cap the input's measure so a line never reads past 55 chars
-                .frame(maxWidth: TextStyle.maxMeasure() + 52 + 2 * PanelGrid.row(gridGutter),
-                       alignment: .leading)
-                .liquid(corner: PanelGrid.radius(gridGutter))
-                .focused($focused)
-                .onSubmit(send)
-                // overlay (not ZStack) so the button can't stretch the bar
-                .overlay(alignment: .trailing) {
-                    // The one solid focal on screen (the reference's shutter):
-                    // a filled accent circle when there's something to send,
-                    // neutral glass otherwise.
-                    Button(action: send) {
-                        Image(systemName: engine.busy ? "stop.fill" : "arrow.up")
-                            .font(.system(size: TypeScale.emphasis, weight: .bold))
-                            .contentTransition(.symbolEffect(.replace))
-                            .frame(width: 32, height: 32)
-                            .foregroundStyle(
-                                canSend
-                                    ? engine.colorTheme.onAccent
-                                    : engine.dim(.right))
-                            .background {
-                                if canSend {
-                                    Circle().fill(engine.colorTheme.accent)
-                                } else {
-                                    Circle().fill(.ultraThinMaterial)
-                                }
-                            }
-                    }
-                    .buttonStyle(.pressable)
-                    .animation(Anim.snappy, value: engine.busy)
-                    .animation(Anim.snappy, value: canSend)
-                    .padding(.trailing, 6)
-                    .disabled(!canSend)
-                    .help(engine.busy ? "Stop" : "Send")
-                    .accessibilityLabel(engine.busy ? "Stop" : "Send")
+            attachmentChips
+            ZStack(alignment: .topLeading) {
+                if question.isEmpty {
+                    Text("ask mentat…  (/help · \"count <word>\" or /freq to count)")
+                        .font(.system(size: 14))
+                        .foregroundStyle(engine.dim(.right))
+                        .padding(.leading, 44).padding(.trailing, 60).padding(.top, 10)
+                        .allowsHitTesting(false)
                 }
+                ComposerTextView(text: $question, height: $inputHeight, maxHeight: 200,
+                                 onSend: send,
+                                 onFiles: { urls in for u in urls { engine.addAttachment(u) } },
+                                 onPaste: handlePaste)
+                    .padding(.leading, 36)
+                    .padding(.trailing, 52)
+                    .frame(height: inputHeight)
+                    .frame(maxWidth: TextStyle.maxMeasure() + 52 + 2 * PanelGrid.row(gridGutter),
+                           alignment: .leading)
+            }
+            .liquid(corner: PanelGrid.radius(gridGutter))
+            // "+" attach (leading)
+            .overlay(alignment: .leading) {
+                Button { showImporter = true } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: TypeScale.emphasis, weight: .semibold))
+                        .frame(width: 32, height: 32)
+                        .foregroundStyle(engine.colorTheme.accent)
+                }
+                .buttonStyle(.plain)
+                .padding(.leading, 6)
+                .help("Attach a file")
+                .accessibilityLabel("Attach a file")
+            }
+            // send / stop (trailing)
+            .overlay(alignment: .trailing) {
+                Button(action: send) {
+                    Image(systemName: engine.busy ? "stop.fill" : "arrow.up")
+                        .font(.system(size: TypeScale.emphasis, weight: .bold))
+                        .contentTransition(.symbolEffect(.replace))
+                        .symbolEffect(.bounce, options: .speed(1.8), value: engine.messages.count)
+                        .frame(width: 32, height: 32)
+                        .foregroundStyle(
+                            canSend ? engine.colorTheme.onAccent : engine.dim(.right))
+                        .background {
+                            if canSend {
+                                Circle().fill(engine.colorTheme.accent)
+                            } else {
+                                Circle().fill(.ultraThinMaterial)
+                            }
+                        }
+                }
+                .buttonStyle(.pressable)
+                .animation(Anim.snappy, value: engine.busy)
+                .animation(Anim.snappy, value: canSend)
+                .padding(.trailing, 6)
+                .disabled(!canSend)
+                .help(engine.busy ? "Stop" : "Send")
+                .accessibilityLabel(engine.busy ? "Stop" : "Send")
+            }
         }
         // one Liquid Glass container for the composer's glass cluster
         .glassContainer(spacing: 6)
         .padding(.horizontal, compact ? 12 : CGFloat(gridMargin))
         .padding(.top, 8)
         .padding(.bottom, compact ? 10 : 18)
+        .overlay {
+            if dropTargeted {
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .stroke(engine.colorTheme.accent, lineWidth: 2)
+                    .background(engine.colorTheme.accent.opacity(0.08),
+                                in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .allowsHitTesting(false)
+            }
+        }
+        .onDrop(of: [UTType.fileURL], isTargeted: $dropTargeted) { providers in
+            for p in providers {
+                _ = p.loadObject(ofClass: URL.self) { url, _ in
+                    if let url { Task { @MainActor in engine.addAttachment(url) } }
+                }
+            }
+            return true
+        }
+        .fileImporter(isPresented: $showImporter, allowedContentTypes: [.item],
+                      allowsMultipleSelection: true) { result in
+            if case .success(let urls) = result {
+                for u in urls { engine.addAttachment(u) }
+            }
+        }
+    }
+
+    /// Staged file chips above the input (name · size · ✕), like Qwen/DeepSeek/Kimi.
+    @ViewBuilder private var attachmentChips: some View {
+        if !engine.pendingAttachments.isEmpty {
+            FlowRow(spacing: 6) {
+                ForEach(engine.pendingAttachments) { a in
+                    HStack(spacing: 6) {
+                        Image(systemName: "doc.text")
+                            .font(.system(size: TypeScale.micro, weight: .semibold))
+                        Text(a.label).font(.system(size: TypeScale.meta)).lineLimit(1)
+                        Button { engine.removeAttachment(a.id) } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: TypeScale.meta))
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Remove attachment")
+                    }
+                    .foregroundStyle(engine.dim(.right))
+                    .padding(.horizontal, 9).padding(.vertical, 4)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .overlay(Capsule().stroke(engine.dim(.right).opacity(0.25), lineWidth: 1))
+                }
+            }
+            .padding(.horizontal, 4)
+        }
     }
 
     private var canSend: Bool {
@@ -1570,12 +1300,34 @@ struct ChatView: View {
         question = ""
         engine.send(q)
     }
+
+    /// Qwen/Kimi behaviour: a large paste becomes a `.txt` attachment instead of
+    /// flooding the input. Short pastes insert normally.
+    private func handlePaste(_ s: String) -> Bool {
+        let long = s.count > 2000 || s.split(separator: "\n").count > 15
+        guard long, let url = writePastedText(s) else { return false }
+        engine.addAttachment(url)
+        return true
+    }
+
+    private func writePastedText(_ s: String) -> URL? {
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Everything/mentat/app/mentat2_data/attachments")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("pasted text \(Int(Date().timeIntervalSince1970)).txt")
+        do {
+            try s.write(to: url, atomically: true, encoding: .utf8)
+            return url
+        } catch {
+            return nil
+        }
+    }
 }
 
-// Debug panel moved to Screens/Debug/DebugPanel.swift.
+// Developer scene moved to Screens/Developer/DeveloperScene.swift.
 
 
-// PaletteSwatches + PaletteGraph moved to Screens/Debug/DebugWidgets.swift.
+
 
 // Settings panels moved to Screens/Menu/Settings.swift.
 
@@ -1602,18 +1354,38 @@ func relativeDate(_ raw: String) -> String {
 struct RootView: View {
     var engine: Engine
     @Environment(\.palette) private var pal
-    @Environment(\.appTheme) private var theme
-    @AppStorage("sidebarVisible") private var sidebarVisible = true
-    @AppStorage("appearance") private var appearanceRaw = AppTheme.fallback.rawValue
     @AppStorage("layoutMode") private var layoutMode = false
     @State private var layoutStore = LayoutGridStore()
-    @State private var designStore = DesignStore()
+    /// Drives the sand surface. Held here but **not read** in `RootView.body`, so
+    /// pointer/scroll events never invalidate the transcript.
+    @State private var sandMotion = SandMotionStore()
+    /// The detail's frame measured in global space — the sand canvas fills it,
+    /// so the pointer maps to the pixel under the cursor's tip.
+    @State private var sandFrame: CGRect = .zero
+    @State private var designStore: DesignStore
+    @State private var inspectorStore: InspectorStore
+    @State private var appStore: AppStore
+    @State private var slotRegistry: SlotRegistry
 
-    /// The history panel is a solid sheet with ink that always contrasts it,
-    /// rather than sampling the photo: a dark, near-opaque panel with light text
-    /// in Noir, and a light panel with dark text in Light.
-    private var noir: Bool { theme == .mono }
-    // The rail follows the OKLCH theme (hue from the image).
+    init(engine: Engine) {
+        self.engine = engine
+        // Register the Developer scene's panels before first render (slots are
+        // observable, but registering up front keeps the seam honest).
+        let registry = SlotRegistry()
+        registry.register(.developerPanels) { EngineInfoPanel(engine: engine) }
+        _slotRegistry = State(initialValue: registry)
+        let design = DesignStore()
+        let inspector = InspectorStore()
+        _designStore = State(initialValue: design)
+        _inspectorStore = State(initialValue: inspector)
+        _appStore = State(initialValue: AppStore(engine: engine, design: design, inspector: inspector))
+        // the surface look is the colour authority — seed it before first render
+        engine.surfaceLook = design.tokens.look
+    }
+
+    /// The history panel is a solid sheet with ink that always contrasts it —
+    /// the look's own surface, never a photo sampled behind it.
+    private var isLightTheme: Bool { engine.colorTheme.isLight }
     private var panel: Color {
         engine.colorTheme.surface.opacity(0.94)
     }
@@ -1634,6 +1406,8 @@ struct RootView: View {
     @AppStorage("pinnedConversations") private var pinnedRaw = ""
     @AppStorage("historyLayout") private var historyLayout = "grid"
     @State private var findText = ""
+    @State private var renameTarget: Conversation? = nil
+    @State private var renameText = ""
 
     private var pinnedSet: Set<String> {
         Set(pinnedRaw.split(separator: "\n").map(String.init))
@@ -1696,9 +1470,10 @@ struct RootView: View {
                          ink: panelInk,
                          dim: panelDim,
                          accent: panelAccent,
-                         isLight: !noir,
+                         isLight: isLightTheme,
                          onTap: { Task { await engine.openConversation(c.conv) } },
                          onPin: { withAnimation(Anim.snappy) { togglePin(c.conv) } },
+                         onEdit: { renameText = c.label; renameTarget = c },
                          onDelete: { Task { await engine.deleteConversation(c.conv) } })
     }
 
@@ -1723,7 +1498,7 @@ struct RootView: View {
             }
         }
         .padding(.horizontal, 9).padding(.vertical, 6)
-        .background(.ultraThinMaterial, in: Capsule(style: .continuous))
+        .surface(shape: Capsule(style: .continuous))
         .overlay(Capsule(style: .continuous).stroke(panelDim.opacity(0.28), lineWidth: 1))
     }
 
@@ -1787,8 +1562,8 @@ struct RootView: View {
 
     var body: some View {
         NavigationSplitView(columnVisibility: Binding(
-            get: { sidebarVisible ? .all : .detailOnly },
-            set: { sidebarVisible = ($0 != .detailOnly) }
+            get: { appStore.state.sidebarVisible ? .all : .detailOnly },
+            set: { appStore.state.sidebarVisible = ($0 != .detailOnly) }
         )) {
                 VStack(spacing: 0) {
                     Button {
@@ -1819,34 +1594,94 @@ struct RootView: View {
                 }
                 .sidebarGlass(solid: panel,
                               tint: engine.colorTheme.surface.opacity(0.55))
-                .background {
-                    // the artwork behind the glass so it refracts the page photo
-                    SidebarArtwork(name: engine.backgroundName,
-                                   quietY: engine.bgQuietY,
-                                   imageSize: engine.bgImageSize,
-                                   artWidth: engine.contentSize.width)
-                }
+                .background(engine.colorTheme.surface)
                 .scrollContentBackground(.hidden)
-                // Rebuild the rail whenever the theme flips, so no colour is
-                // left over from the previous mode (kept the old text tint).
-                .id(theme)
+                // Palette/tokens adapt live (observable) — no `.id(theme)` subtree
+                // rebuild, which used to hitch the rail on every appearance flip.
                 .navigationSplitViewColumnWidth(
                     min: designStore.tokens.metrics.sidebarMin,
                     ideal: designStore.tokens.metrics.sidebarIdeal,
                     max: designStore.tokens.metrics.sidebarMax)
             } detail: {
-                // the page (art + grid) owns the detail column; the sidebar
-                // renders its own continuation of the artwork (SidebarArtwork)
                 ZStack {
-                    DesertBackground(name: engine.backgroundName,
-                                     quietY: engine.bgQuietY,
-                                     imageSize: engine.bgImageSize)
-                    ChatView(engine: engine)
+                    // The procedural sand is the **Sand** canvas. Every other look
+                    // owns its own surface (paper cream, system, mono), so colour
+                    // and ink stay paired — no dark ink over a dark shader.
+                    if designStore.tokens.sand.enabled, designStore.tokens.look == .sand {
+                        // Two amber masses travel the frame and cross-fade to
+                        // deep-orange, grain streaming like wind-blown sand —
+                        // always moving, nudged by the UI.
+                        SandCanvas(
+                            style: .sand.merging(designStore.tokens.sand),
+                            store: sandMotion,
+                            busy: engine.busy)
+                    } else {
+                        engine.colorTheme.background
+                    }
+                    // The inspector is an **in-content** trailing pane, not the
+                    // native `.inspector`: the system one hosts itself in the
+                    // window and forced it to grow when opened. Here the window
+                    // never resizes — the reading column just narrows.
+                    HStack(spacing: 0) {
+                        ChatView(engine: engine)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        if inspectorStore.visible {
+                            Rectangle()
+                                .fill(engine.colorTheme.border.opacity(0.5))
+                                .frame(width: 1)
+                            InspectorPane(engine: engine, inspector: inspectorStore)
+                                .frame(width: inspectorStore.width)
+                                .transition(.move(edge: .trailing).combined(with: .opacity))
+                        }
+                    }
+                }
+                .background(GeometryReader { g in
+                    Color.clear
+                        .onAppear { sandFrame = g.frame(in: .global) }
+                        .onChange(of: g.frame(in: .global)) { _, f in sandFrame = f }
+                })
+                .animation(Anim.snappy, value: inspectorStore.visible)
+                .onContinuousHover(coordinateSpace: .global) { phase in
+                    // Map the pointer into the detail's frame so the obstacle
+                    // sits under the cursor tip.
+                    switch phase {
+                    case .active(let p):
+                        let s = sandFrame.size.width < 2 ? engine.contentSize : sandFrame.size
+                        sandMotion.setPointer(CGPoint(x: p.x - sandFrame.minX,
+                                                      y: p.y - sandFrame.minY), in: s)
+                    case .ended: sandMotion.clearPointer()
+                    }
+                }
+                // Big moves nudge the sand; small ones barely register.
+                .onChange(of: engine.messages.count) { _, _ in sandMotion.emit(.send) }
+                .onChange(of: engine.busy) { _, b in sandMotion.setBreath(b ? 1 : 0) }
+                .onChange(of: inspectorStore.visible) { _, v in
+                    sandMotion.emit(.panel(.trailing, open: v))
+                }
+                .onChange(of: appStore.state.sidebarVisible) { _, v in
+                    sandMotion.emit(.panel(.leading, open: v))
+                }
+                .onChange(of: designStore.tokens.look) { _, _ in sandMotion.emit(.modeChange) }
+                .onChange(of: engine.contentSize) { old, new in
+                    // ignore the first layout (0 → size): that is not a resize
+                    guard old != .zero, new != .zero else { return }
+                    sandMotion.emit(.resize(dx: new.width - old.width,
+                                            dy: new.height - old.height))
                 }
             }
         .environment(layoutStore)
         .environment(designStore)
+        .environment(inspectorStore)
+        .environment(\.slots, slotRegistry)
+        .environment(appStore)
+        .environment(\.runUIAction) { action in
+            appStore.send(action)
+        }
+        .environment(\.sandMotion, sandMotion)
         .environment(\.design, designStore.tokens)
+        .task { sandMotion.configure(designStore.tokens.sand) }
+        .onChange(of: designStore.tokens.sand) { _, t in sandMotion.configure(t) }
+        .onChange(of: designStore.tokens.look) { _, look in engine.surfaceLook = look }
         .background(Color.clear)
         .background(
             GeometryReader { g in
@@ -1856,6 +1691,24 @@ struct RootView: View {
             }
         )
         .hideWindowToolbar()      // no system toolbar stacked above the header
+        // paint the window/canvas so no system light background shows through
+        .background(engine.colorTheme.background)
+        .alert("Edit title", isPresented: Binding(
+            get: { renameTarget != nil },
+            set: { if !$0 { renameTarget = nil } }
+        )) {
+            TextField("Conversation title", text: $renameText)
+            Button("Save") {
+                if let t = renameTarget {
+                    let title = renameText
+                    Task { await engine.renameConversation(t.conv, title) }
+                }
+                renameTarget = nil
+            }
+            Button("Cancel", role: .cancel) { renameTarget = nil }
+        } message: {
+            Text("Rename this conversation.")
+        }
         .overlay { if layoutMode { LayoutInstrument(store: layoutStore, isOn: $layoutMode) } }
         // Hide the native traffic lights — the custom header stands alone.
         .overlay(alignment: .topLeading) {
@@ -1869,6 +1722,12 @@ struct RootView: View {
                 .opacity(0)
         )
         .background(
+            // ⌘I toggles the right-hand Inspector (citations · source · files · context).
+            Button("Inspector") { withAnimation(Anim.snappy) { inspectorStore.toggle() } }
+                .keyboardShortcut("i", modifiers: .command)
+                .opacity(0)
+        )
+        .background(
             Button("Dismiss") {
                 if layoutMode { withAnimation(Anim.snappy) { layoutMode = false } }
                 else if !findText.isEmpty { findText = "" }
@@ -1878,10 +1737,16 @@ struct RootView: View {
         )
         .task {
             await engine.loadConversations()
-            engine.loadBackgrounds()
         }
-        .onChange(of: appearanceRaw) { _, _ in
-            engine.selectBackground(engine.backgroundName)
+        .onChange(of: appStore.state.appearanceRaw) { _, newValue in
+            // appearance swap is O(1) from cached data (no re-analysis) and
+            // crossfades unless Reduce Motion is on.
+            let t = AppTheme(rawValue: newValue) ?? .fallback
+            if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                engine.setAppearance(t)
+            } else {
+                withAnimation(Anim.smooth) { engine.setAppearance(t) }
+            }
         }
     }
 }

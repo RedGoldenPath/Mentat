@@ -56,6 +56,11 @@ import SwiftUI
 
     var messages: [ChatMessage] = []
     var busy = false
+    /// Files staged in the composer (drag-and-drop / paperclip), sent with the next message.
+    var pendingAttachments: [ChatAttachment] = []
+    /// Inline message editor (ChatGPT-style): the message being edited + its draft.
+    var editingID: UUID?
+    var editingText: String = ""
     var online = false
     var status = "starting…"
     var model = ""
@@ -66,7 +71,11 @@ import SwiftUI
     /// the live chat transcript).
     var libraryDoc: [DocBlock] = []
     var libraryDocId: String = ""
-    var currentConv: String = ""
+    /// The active conversation thread. Persisted so quitting/reopening the app
+    /// continues the same thread (OpenAI Conversations-object semantics).
+    var currentConv: String = UserDefaults.standard.string(forKey: "currentConversation") ?? "" {
+        didSet { UserDefaults.standard.set(currentConv, forKey: "currentConversation") }
+    }
     /// A message the transcript should bring to the centre of the viewport
     /// (set when a reader pages through an answer, so the page transition can't
     /// drift it out of view). Cleared once honoured.
@@ -87,35 +96,21 @@ import SwiftUI
     var settingsSpec: [SettingSpec] = []
     var settingsValues: [String: Any] = [:]
     var settingsOptions: [String: [String]] = [:]
-    var backgrounds: [String] = []
-    var backgroundName: String = ""
-    var bgIsLight: Bool = false
-    var bgLightLeft = false
-    var bgLightCenter = false
-    var bgLightRight = false
-    var bgTint: Color = Color.white.opacity(0.12)
-    var bgTintLeft: Color = Color.white.opacity(0.14)
-    var bgTintCenter: Color = Color.white.opacity(0.14)
-    var bgTintRight: Color = Color.white.opacity(0.14)
-    var bgRegionAvg: [NSColor] = []  // [left, center, right]
-    var bgTopColor: NSColor = NSColor(white: 0.5, alpha: 1)
-    /// The OKLCH colour system: the image reduced to perceptual colour, the
-    /// user's controls, and the resulting contrast-enforced theme.
-    var imagePalette: ImagePalette = .neutral
-    var colorControls: ColorControls = .default
+    /// The surface-first look. Colour is resolved from this (and light/dark), not
+    /// sampled from a photo — the single colour authority for content + chrome.
+    var surfaceLook: SurfaceLook = .sand { didSet { rebuildLookTheme() } }
+    /// Semantic text colours (quote/heading/link/citation/number) for the look.
+    private(set) var textInk: TextInk = TextInk.look(.sand, isDark: true)
+    /// The resolved theme every surface + ink role reads from.
     var colorTheme: ColorTheme = .placeholder
-    enum InkMode: String, Codable, Sendable { case theme, background }
-    /// Whether text ink comes from the theme (matches the palette) or adapts to
-    /// the photo behind each region (default). No outlines either way.
-    var inkMode: InkMode =
-        InkMode(rawValue: UserDefaults.standard.string(forKey: "inkMode") ?? "") ?? .background
     /// Tinted (colour-forward) or clear (clarity-forward) Liquid Glass.
     var glassStyle: GlassStyle =
         GlassStyle(rawValue: UserDefaults.standard.string(forKey: "glassStyle") ?? "") ?? .tinted
-    /// Normalized y (top-origin) of the calmest band in the photo, so the art
-    /// can be panned to sit its least-contrasty region behind the wordmark.
-    var bgQuietY: CGFloat = 0.4
     var contentSize: CGSize = .zero
+    /// The window's top safe-area inset (the titlebar / traffic-light band).
+    /// The window uses `.hiddenTitleBar`, so the grid must start below this or
+    /// the masthead clips into the titlebar (Apple HIG *Layout — safe areas*).
+    var topInset: CGFloat = 0
     /// Size of the whole window (RootView), so overlays can show how the page
     /// layer sits inside it when the sidebar is open.
     var windowSize: CGSize = .zero
@@ -124,151 +119,32 @@ import SwiftUI
     var debugMode = UserDefaults.standard.bool(forKey: "debugMode") {
         didSet { UserDefaults.standard.set(debugMode, forKey: "debugMode") }
     }
-    private var backgroundsLoaded = false
-    /// Size at which the background regions were last sampled, so a drifting
-    /// geometry (sidebar animation) doesn't re-run the CI reads on every frame.
-    private var lastRegionSize: CGSize = .zero
 
-    func isLight(_ r: BgRegion) -> Bool {
-        colorTheme.isLight
-    }
-    /// Complementary, low-saturation tint drawn from the colour behind a region.
-    func tint(_ r: BgRegion) -> Color {
-        colorTheme.surfaceTint
-    }
+    func isLight(_ r: BgRegion) -> Bool { colorTheme.isLight }
+    /// The look's stained-glass surface tint, by role.
+    func tint(_ r: BgRegion) -> Color { colorTheme.surfaceTint }
 
-    /// Representative colour of the whole artwork (mean of the sampled regions),
-    /// for deriving the history rail's analogous tint.
-    func artMeanColor() -> NSColor {
-        guard !bgRegionAvg.isEmpty else { return NSColor(white: 0.5, alpha: 1) }
-        var r: CGFloat = 0
-        var g: CGFloat = 0
-        var b: CGFloat = 0
-        for c in bgRegionAvg {
-            let cc = c.usingColorSpace(.deviceRGB) ?? .gray
-            r += cc.redComponent
-            g += cc.greenComponent
-            b += cc.blueComponent
-        }
-        let n = CGFloat(bgRegionAvg.count)
-        return NSColor(red: r / n, green: g / n, blue: b / n, alpha: 1)
-    }
-
-    func regionColor(_ r: BgRegion) -> NSColor {
-        guard !bgRegionAvg.isEmpty else { return NSColor(white: 0.5, alpha: 1) }
-        switch r {
-        case .left: return bgRegionAvg[0]
-        case .center: return bgRegionAvg[min(1, bgRegionAvg.count - 1)]
-        case .right: return bgRegionAvg[bgRegionAvg.count - 1]
-        }
-    }
-
-    /// Colour-theory text palette for a region. **Luminance first**: value flips
-    /// smoothly with how light the art reads (light text on dark, near-black on
-    /// light). **Then hue**: when the art is colourful the ink picks up a whisper
-    /// of its *contrasting* temperature, so the type reads as a considered colour
-    /// rather than flat grey — but at ≤0.10 saturation, so contrast never suffers.
+    /// Semantic text palette. The look owns ink, so every region resolves to the
+    /// same roles — content sits on a solid surface, never on a photo.
     func textColors(_ r: BgRegion) -> (primary: Color, secondary: Color) {
-        switch inkMode {
-        case .theme:
-            return (colorTheme.ink, colorTheme.inkDim)
-        case .background:
-            return adaptiveInk(r)
-        }
+        (colorTheme.ink, colorTheme.inkDim)
     }
 
-    /// Region-adaptive ink: pick light/dark from the photo behind the region and
-    /// enforce WCAG against it. A whisper of the theme hue; no outline.
-    private func adaptiveInk(_ r: BgRegion) -> (Color, Color) {
-        let key = regionKey(r) + "|adapt"
-        if let hit = textColorCache[key] { return hit }
-        let ns = regionColor(r)
-        let result = (adaptiveText(ns, dim: false), adaptiveText(ns, dim: true))
-        textColorCache[key] = result
-        return result
-    }
+    /// One ink for a region (the look's ink). Region-adaptive sampling is retired
+    /// — the seam stays so callers have a single place to resolve ink.
+    func adaptiveInk(_ region: BgRegion = .center) -> Color { colorTheme.ink }
 
-    private func adaptiveText(_ ns: NSColor, dim: Bool) -> Color {
-        let target = ColorScience.oklch(ns)
-        let appearance =
-            AppTheme(rawValue: UserDefaults.standard.string(forKey: "appearance") ?? "")
-            ?? .fallback
-        let bgLight = BackgroundAnalysis.gradedLuminance(ns, theme: appearance) >= 0.5
-        let l = dim ? (bgLight ? 0.42 : 0.80) : (bgLight ? 0.16 : 0.96)
-        let ink = ColorScience.enforce(
-            ColorScience.OKLCH(l: l, c: 0.02, h: colorTheme.baseHue), on: target, level: .body)
-        return Color(nsColor: ColorScience.nsColor(ink))
-    }
-
-    /// Memoized `adaptiveText` for the top band — called from several view
-    /// bodies every frame, but only changes when the sampled art does.
-    private func topInk(dim: Bool) -> Color {
-        let key = "\(colorVersion)|topink|\(dim ? 1 : 0)"
-        if let hit = textColorCache[key] { return hit.0 }
-        let c = adaptiveText(bgTopColor, dim: dim)
-        textColorCache[key] = (c, c)
-        return c
-    }
-
-    /// Title colour: mostly plain black or white for guaranteed contrast
-    /// (dark title on light art, light on dark). Only when the artwork behind
-    /// is genuinely colourful does it take on a bright *analogous* hue — one that
-    /// stays in the art's own warm/cool family — never a muddy mid-tone.
-    func titleColor(_ r: BgRegion = .center) -> Color {
-        inkMode == .theme ? colorTheme.ink : adaptiveInk(r).0
-    }
-
-    /// The region's colour temperature (warm/cool/neutral) — the hue axis that
-    /// decides which side of the wheel the UI leans toward.
-    func temperature(_ r: BgRegion) -> ColorTheory.Temperature {
-        ColorTheory.temperature(regionColor(r))
-    }
-    func artTemperature() -> ColorTheory.Temperature {
-        ColorTheory.temperature(artMeanColor())
-    }
-
-    /// UI accent for a region: from the artwork palette (a saturated tone of the
-    /// art's contrasting temperature), so controls pop against a warm photo with
-    /// cool accents and vice-versa. Falls back to the brand spice for greyscale.
-    func accentColor(_ r: BgRegion = .left) -> Color {
-        colorTheme.accent
-    }
-
-    /// Title colour for the top band (the wordmark once it rises to R1): plain
-    /// high-contrast black or white, with an analogous hue when colourful.
-    func topTitleColor() -> Color {
-        inkMode == .theme ? colorTheme.ink : topInk(dim: false)
-    }
+    /// UI accent: the look's accent. One focal colour, by role.
+    func accentColor(_ r: BgRegion = .left) -> Color { colorTheme.accent }
 
     func text(_ r: BgRegion) -> Color { textColors(r).primary }
     func dim(_ r: BgRegion) -> Color { textColors(r).secondary }
 
     // MARK: wordmark ink
 
-    /// Size of the artwork as decoded (aspect preserved), so the background can
-    /// be panned to put a quiet band behind the title.
-    private(set) var bgImageSize: CGSize = .zero
-
-    /// One consistent ink for the whole wordmark: white or near-black, decided
-    /// once from the overall brightness of the top band behind it. No per-letter
-    /// sampling, so the word can never come out patchwork.
-    func titleInk() -> Color {
-        guard !bgRegionAvg.isEmpty else { return .primary }
-        let theme =
-            AppTheme(rawValue: UserDefaults.standard.string(forKey: "appearance") ?? "")
-            ?? .fallback
-        // Always luminance-based so the wordmark stays legible on any art.
-        return BackgroundAnalysis.gradedLuminance(bgTopColor, theme: theme) < 0.5
-            ? Color(white: 1.0) : Color(white: 0.06)
-    }
-
-    /// High-contrast foreground for the top area (empty state / chrome).
-    func topText() -> Color {
-        inkMode == .theme ? colorTheme.ink : topInk(dim: false)
-    }
-    func topTextDim() -> Color {
-        inkMode == .theme ? colorTheme.inkDim : topInk(dim: true)
-    }
+    /// One consistent ink for the whole wordmark, resolved from the look so the
+    /// word can never come out patchwork.
+    func titleInk() -> Color { colorTheme.ink }
 
     /// Comfortable reading measure: the width of `chars` average characters
     /// (books aim for ~45–75 characters per line).
@@ -298,29 +174,6 @@ import SwiftUI
         // Stained glass: one consistent plate from the theme, so the material
         // reads as a single surface rather than varying per photo region.
         colorTheme.isLight ? 0.42 : 0.58
-    }
-
-    /// Colour math hit by every row render; cached per region and invalidated
-    /// whenever the sampled artwork changes.
-    @ObservationIgnored private var colorVersion = 0
-    @ObservationIgnored private var textColorCache: [String: (Color, Color)] = [:]
-    @ObservationIgnored private var scrimCache: [String: Double] = [:]
-
-    private func regionKey(_ r: BgRegion) -> String {
-        let tag: String
-        switch r {
-        case .left: tag = "l"
-        case .center: tag = "c"
-        case .right: tag = "r"
-        }
-        return "\(colorVersion)|\(tag)"
-    }
-
-    /// Drop cached colour derivations (call when the sampled regions change).
-    private func invalidateColorCaches() {
-        colorVersion &+= 1
-        textColorCache.removeAll()
-        scrimCache.removeAll()
     }
 
     private let engineProcess = EngineProcess.default()
@@ -369,14 +222,36 @@ import SwiftUI
             runSlash(q)
             return
         }
-        askTask = Task { await ask(q) }
+        let atts = pendingAttachments
+        pendingAttachments = []
+        askTask = Task { await ask(q, attachments: atts) }
     }
 
-    func ask(_ raw: String) async {
+    // MARK: attachments (drag-and-drop / paperclip)
+
+    func addAttachment(_ url: URL) {
+        guard pendingAttachments.count < 5 else { return }
+        if pendingAttachments.contains(where: { $0.path == url.path }) { return }
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let size = (attrs?[.size] as? NSNumber)?.intValue ?? 0
+        pendingAttachments.append(
+            ChatAttachment(name: url.lastPathComponent, path: url.path, bytes: size))
+    }
+
+    func removeAttachment(_ id: UUID) {
+        pendingAttachments.removeAll { $0.id == id }
+    }
+
+    func clearAttachments() { pendingAttachments.removeAll() }
+
+    func ask(_ raw: String) async { await ask(raw, attachments: []) }
+
+    func ask(_ raw: String, attachments: [ChatAttachment]) async {
         let q = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty, !busy else { return }
         busy = true
-        messages.append(ChatMessage(role: .user, text: q))
+        messages.append(ChatMessage(role: .user, text: q,
+                                    attachmentNames: attachments.map { $0.name }))
         messages.append(
             ChatMessage(
                 role: .assistant, streaming: true, progress: "thinking…", pendingQuestion: q))
@@ -389,14 +264,14 @@ import SwiftUI
             busy = false
             if idx < messages.count, messages[idx].id == mid { messages[idx].streaming = false }
         }
-        let received = await stream(q, at: idx, id: mid)
+        let received = await stream(q, at: idx, id: mid, attachments: attachments)
         if Task.isCancelled {
             if idx < messages.count, messages[idx].id == mid, messages[idx].text.isEmpty {
                 messages[idx].text = "_[stopped]_"
             }
             return
         }
-        if !received { await askOnce(q, at: idx, id: mid) }
+        if !received { await askOnce(q, at: idx, id: mid, attachments: attachments) }
     }
 
     func stop() {
@@ -470,22 +345,14 @@ import SwiftUI
         pageTurn = PageTurn(id: id, delta: delta, token: (pageTurn?.token ?? 0) + 1)
     }
 
-    func reAsk(_ id: UUID) {
-        guard let i = messages.firstIndex(where: { $0.id == id }) else { return }
-        let q = messages[i].pendingQuestion ?? messages[i].text
-        askTask?.cancel()
-        busy = false
-        for m in messages[i...] { pageCounts[m.id] = nil }
-        messages.removeSubrange(i...)
-        askTask = Task { await ask(q) }
-    }
-
-    private func stream(_ q: String, at idx: Int, id mid: UUID) async -> Bool {
+    private func stream(_ q: String, at idx: Int, id mid: UUID,
+                        attachments: [ChatAttachment] = []) async -> Bool {
         var received = false
         var lastFlush = Date.distantPast
         var pending = ""
         do {
-            for try await ev in client.streamEvents(question: q) {
+            for try await ev in client.streamEvents(question: q, conversation: currentConv,
+                                                     attachments: attachments) {
                 if Task.isCancelled { break }
                 // The transcript can be reset or switched mid-stream (/clear,
                 // New Conversation, history). Stop writing rather than index a
@@ -543,6 +410,8 @@ import SwiftUI
                 m.model = md
                 model = md
             }
+            // adopt the thread id so the next turn continues this conversation
+            if let c = ev.conversation, !c.isEmpty { currentConv = c }
             m.progress = ""
         case "error":
             m.text = "Error: \(ev.v ?? "unknown")"
@@ -553,9 +422,11 @@ import SwiftUI
         }
     }
 
-    private func askOnce(_ q: String, at idx: Int, id mid: UUID) async {
+    private func askOnce(_ q: String, at idx: Int, id mid: UUID,
+                         attachments: [ChatAttachment] = []) async {
         do {
-            let res = try await client.ask(question: q)
+            let res = try await client.ask(question: q, conversation: currentConv,
+                                           attachments: attachments)
             guard let m = liveMessage(idx, mid) else { return }
             if let ans = res.answer, !ans.isEmpty {
                 m.text = TextStyle.clean(ans)
@@ -569,6 +440,7 @@ import SwiftUI
                 m.model = md
                 model = md
             }
+            if let c = res.conversation, !c.isEmpty { currentConv = c }
         } catch {
             guard let m = liveMessage(idx, mid) else { return }
             m.text = "Error: \(error.localizedDescription)"
@@ -594,6 +466,8 @@ import SwiftUI
     }
 
     func runCommand(_ cmd: String, _ arg: String) async {
+        // App-side generative commands: render a scene inline, no brain needed.
+        if cmd == "scene" || cmd == "chart" { appendScene(arg); return }
         busy = true
         defer { busy = false }
         do {
@@ -632,6 +506,43 @@ import SwiftUI
         else { return }
         await client.setSetting(body: body)
         await loadSettings()
+    }
+
+    static let demoSceneJSON = """
+    {"title":"Indexed library","elements":[
+      {"kind":"kpi","kpi":{"label":"Chunks indexed","value":"8,214","delta":"+1.2% this week","deltaUp":true}},
+      {"kind":"chart","chart":{"style":"bar","title":"Chunks per work","series":[{"label":"Kojeve","value":9},{"label":"Hegel","value":6},{"label":"Dune","value":4},{"label":"Notes","value":7}]}},
+      {"kind":"table","table":{"columns":["Work","Chunks","Words"],"rows":[["Kojeve","932","120k"],["Hegel","611","88k"],["Dune","404","61k"]]}}
+    ]}
+    """
+
+    /// Append a model-authored `scene` block so the generative UI path is
+    /// visible (from `/scene`, or the debug demo). Empty `json` uses the demo.
+    func appendScene(_ json: String = "") {
+        let body = json.trimmingCharacters(in: .whitespacesAndNewlines)
+        messages.append(ChatMessage(
+            role: .assistant,
+            text: "Here is a generated view.\n\n```scene\n\(body.isEmpty ? Self.demoSceneJSON : body)\n```"))
+    }
+
+    func appendDemoScene() { appendScene() }
+
+    /// Debug affordance: a markdown answer that exercises the semantic text
+    /// colours (heading · quote · link · number · citation).
+    func appendDemoMarkdown() {
+        messages.append(ChatMessage(
+            role: .assistant,
+            text: """
+            # On the creditor oligarchy
+
+            > "The great monopoly in this country is the money monopoly."
+            > — Woodrow Wilson
+
+            You can read the primary text at https://example.com/woodrow against the
+            Federal Reserve Act itself, and compare 1859 with 1913.
+
+            **Bold** and *italic* still read; and a citation (Kojeve · Introduction).
+            """))
     }
 
     func loadConversations() async {
@@ -715,11 +626,92 @@ import SwiftUI
     func newConversation() async {
         askTask?.cancel()
         busy = false
-        await client.newConversation()
-        currentConv = ""
+        currentConv = await client.newConversation() ?? ""
         messages.removeAll()
         resetTranscriptState()
         await loadConversations()
+    }
+
+    func renameConversation(_ id: String, _ title: String) async {
+        await client.renameConversation(id: id, title: title)
+        await loadConversations()
+    }
+
+    // MARK: message edit / delete / regenerate
+    // The *rules* (what to forget, how the thread shifts) live in the engine
+    // (store.truncate_conversation / delete_turn). The app only names the
+    // operation and then re-projects the transcript from /conversation.
+
+    /// The 0-based turn this message belongs to = user messages before it.
+    func turnIndex(for id: UUID) -> Int? {
+        guard let i = messages.firstIndex(where: { $0.id == id }) else { return nil }
+        return messages[..<i].filter { $0.role == .user }.count
+    }
+
+    func beginEdit(_ id: UUID) {
+        guard let m = messages.first(where: { $0.id == id }) else { return }
+        editingID = id
+        editingText = m.text
+    }
+
+    func cancelEdit() {
+        editingID = nil
+        editingText = ""
+    }
+
+    /// Replace a user message and re-ask from there (everything after is forgotten).
+    func editMessage(_ id: UUID, to newText: String) async {
+        let q = newText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty, let turn = turnIndex(for: id) else { return }
+        stop()
+        editingID = nil
+        editingText = ""
+        await client.truncateConversation(id: currentConv, keep: turn)
+        await rebuildTranscript()
+        busy = false
+        await ask(q)
+    }
+
+    /// Delete a user message and its answer (the engine closes the gap).
+    func deleteMessage(_ id: UUID) async {
+        guard let turn = turnIndex(for: id) else { return }
+        stop()
+        if editingID == id { cancelEdit() }
+        await client.deleteTurn(id: currentConv, index: turn)
+        await rebuildTranscript()
+    }
+
+    /// Re-ask a question whose answer sits at `id` (assistant row).
+    func regenerate(_ id: UUID) async {
+        guard let i = messages.firstIndex(where: { $0.id == id }) else { return }
+        let priorUser = messages[..<i].last(where: { $0.role == .user })?.text ?? ""
+        guard !priorUser.isEmpty else { return }
+        let turn = messages[..<i].filter { $0.role == .user }.count - 1
+        stop()
+        await client.truncateConversation(id: currentConv, keep: max(0, turn))
+        await rebuildTranscript()
+        busy = false
+        await ask(priorUser)
+    }
+
+    /// Rebuild the live transcript from the engine's stored turns (the projection).
+    private func rebuildTranscript() async {
+        guard !currentConv.isEmpty else { return }
+        let turns = (try? await client.conversation(id: currentConv)) ?? []
+        var rebuilt: [ChatMessage] = []
+        for t in turns {
+            let q = t.question ?? ""
+            let a = t.answer ?? ""
+            if !q.isEmpty { rebuilt.append(ChatMessage(role: .user, text: q, pendingQuestion: q)) }
+            if !a.isEmpty {
+                let m = ChatMessage(role: .assistant, text: TextStyle.clean(a))
+                m.model = t.model ?? ""
+                m.citations = extractCitations(a)
+                rebuilt.append(m)
+            }
+        }
+        messages = rebuilt
+        resetTranscriptState()
     }
 
     func deleteConversation(_ id: String) async {
@@ -736,291 +728,31 @@ import SwiftUI
         await loadConversations()
     }
 
-    // MARK: backgrounds
+    // MARK: theme (one authority)
 
-    var bgText: Color { bgIsLight ? Color(red: 0.10, green: 0.08, blue: 0.06) : Color(white: 0.97) }
-    var bgTextDim: Color {
-        bgIsLight ? Color(red: 0.32, green: 0.26, blue: 0.18) : Color(white: 0.72)
+    private func appearancePref() -> AppTheme {
+        AppTheme(rawValue: UserDefaults.standard.string(forKey: "appearance") ?? "") ?? .fallback
     }
 
-    func loadBackgrounds() {
-        guard !backgroundsLoaded else { return }
-        backgroundsLoaded = true
-        // Cataloguing reads ImageIO metadata for ~130 files; keep it off-main so
-        // first paint isn't gated on it.
-        Task { [weak self] in
-            let names = await Task.detached(priority: .userInitiated) {
-                BackgroundAnalysis.catalog()
-            }.value
-            guard let self else { return }
-            self.backgrounds = names
-            guard !names.isEmpty else { return }
-            let saved = UserDefaults.standard.string(forKey: "background") ?? ""
-            // First launch should show the colour system off: alphabetical order
-            // would land on whatever `bg-` sorts first, which is often a washed
-            // -out photo that reads as grey. Prefer a vivid curated piece.
-            let preferred = "bg-curated-aurora-1"
-            let fallback = names.contains(preferred) ? preferred : names[0]
-            if UserDefaults.standard.bool(forKey: "shuffleBackgrounds"),
-                let r = names.randomElement()
-            {
-                self.selectBackground(r)
-            } else {
-                self.selectBackground(names.contains(saved) ? saved : fallback)
-            }
-        }
+    /// Resolve the whole colour system from the surface look + light/dark choice.
+    /// No image sampling: this is what makes the app cohesive and legible by
+    /// construction (Material 3 "on-" roles / Apple semantic colours).
+    func rebuildLookTheme() {
+        let isDark = surfaceLook.isDark(appearance: appearancePref())
+        colorTheme = ColorTheme.look(surfaceLook, isDark: isDark)
+        textInk = TextInk.look(surfaceLook, isDark: isDark)
     }
 
-    func selectBackground(_ name: String) {
-        guard !name.isEmpty else { return }
-        invalidateColorCaches()
-        backgroundName = name
-        UserDefaults.standard.set(name, forKey: "background")
-        let appearance =
-            AppTheme(rawValue: UserDefaults.standard.string(forKey: "appearance") ?? "")
-            ?? .fallback
-        guard let img = BackgroundAnalysis.thumb(name, max: 512) else { return }
-        bgImageSize = img.size
-        rebuildColorTheme(for: name, image: img)
-        lastRegionSize = .zero
-        // The quiet-band scan (36 samples) and the region read run off-main;
-        // neither should be able to hitch a background switch.
-        scheduleRegionAnalysis(name: name, image: img, appearance: appearance, computeQuiet: true)
-    }
-
-    /// Shared pipeline for region sampling: build the source rects off-main from
-    /// the visible geometry, read the averages, then publish on the main actor.
-    private func scheduleRegionAnalysis(
-        name: String, image: NSImage, appearance: AppTheme, computeQuiet: Bool
-    ) {
-        let key = "thumb|\(name)"
-        let content = contentSize
-        let imageSize = bgImageSize
-        let quietY = bgQuietY
-        let box = Unchecked(image)
-        regionTask?.cancel()
-        regionTask = Task { [weak self] in
-            let started = CFAbsoluteTimeGetCurrent()
-            let out = await Task.detached(priority: .userInitiated) {
-                () -> (CGFloat?, [BackgroundAnalysis.RGB]) in
-                let q =
-                    computeQuiet
-                    ? BackgroundAnalysis.cachedQuietBandY(box.value, key: key, theme: appearance)
-                    : nil
-                let rects = BackgroundAnalysis.regionRects(
-                    content: content, image: imageSize, quietY: q ?? quietY)
-                let samples = BackgroundAnalysis.regionAverages(box.value, key: key, rects: rects)
-                return (q, samples)
-            }.value
-            guard let self, !Task.isCancelled else { return }
-            if let q = out.0 { self.bgQuietY = q }
-            self.applyRegionSamples(out.1, appearance: appearance)
-            Perf.record("regions", ms: (CFAbsoluteTimeGetCurrent() - started) * 1000)
-        }
-    }
-
-    private func applyRegionSamples(_ s: [BackgroundAnalysis.RGB], appearance: AppTheme) {
-        guard s.count == 4 else { return }
-        let lAvg = s[0].nsColor
-        let cAvg = s[1].nsColor
-        let rAvg = s[2].nsColor
-        bgRegionAvg = [lAvg, cAvg, rAvg]
-        bgTopColor = s[3].nsColor
-        invalidateColorCaches()
-        let light = { (c: NSColor) in BackgroundAnalysis.gradedLuminance(c, theme: appearance) > 0.5
-        }
-        bgLightLeft = light(lAvg)
-        bgLightCenter = light(cAvg)
-        bgLightRight = light(rAvg)
-        bgTintLeft = BackgroundAnalysis.complementaryTint(from: lAvg, isLight: bgLightLeft)
-        bgTintCenter = BackgroundAnalysis.complementaryTint(from: cAvg, isLight: bgLightCenter)
-        bgTintRight = BackgroundAnalysis.complementaryTint(from: rAvg, isLight: bgLightRight)
-        bgIsLight = bgLightCenter
-        bgTint = bgTintCenter
-    }
-
-    /// Build the OKLCH theme for `name`. The pixel sample is taken on the main
-    /// thread (cheap), but the quantization runs off-main so a background switch
-    /// can't hitch; the theme is published back on the main actor.
-    func rebuildColorTheme(for name: String, image: NSImage? = nil) {
-        colorControls = currentColorControls()
-        guard !name.isEmpty,
-            let img = image ?? BackgroundAnalysis.thumb(name, max: 320)
-        else {
-            imagePalette = .neutral
-            colorTheme = .placeholder
-            return
-        }
-        let controls = colorControls
-        let box = Unchecked(img)
-        analysisTask?.cancel()
-        analysisTask = Task { [weak self] in
-            let started = CFAbsoluteTimeGetCurrent()
-            let palette = await Task.detached(priority: .utility) {
-                guard let px = ImageAnalyzer.pixels(box.value, side: 56) else {
-                    return ImagePalette.neutral
-                }
-                return ImageAnalyzer.quantize(px, side: 56)
-            }.value
-            guard let self, !Task.isCancelled else { return }
-            self.imagePalette = palette
-            self.colorTheme = ColorResolver.theme(for: palette, controls: controls)
-            Perf.record("analyze", ms: (CFAbsoluteTimeGetCurrent() - started) * 1000)
-        }
-    }
-
-    /// Cached OKLCH analysis for an arbitrary background (the debug picker), so
-    /// the debug panel never re-analyzes on every render.
-    @ObservationIgnored private var paletteCache: [String: ImagePalette] = [:]
-    @ObservationIgnored private var analysisTask: Task<Void, Never>?
-    @ObservationIgnored private var regionTask: Task<Void, Never>?
-    func palette(for name: String) -> ImagePalette {
-        if name.isEmpty { return imagePalette }
-        if let hit = paletteCache[name] { return hit }
-        guard let img = BackgroundAnalysis.thumb(name, max: 320) else { return .neutral }
-        let p = Perf.time("analyze") { ImageAnalyzer.analyze(img) }
-        paletteCache[name] = p
-        if paletteCache.count > 32 { paletteCache.removeAll() }
-        return p
-    }
-
-    private func currentColorControls() -> ColorControls {
-        let defaults = UserDefaults.standard
-        // One-time lift: installs from before the vibrancy pass stored the old
-        // 1.0/1.0 defaults, so the raised ceilings were never felt. Nudge only
-        // untouched values to the Vivid starting point.
-        if !defaults.bool(forKey: "colorVividBumpV1") {
-            defaults.set(true, forKey: "colorVividBumpV1")
-            if defaults.object(forKey: "colorChroma") == nil
-                || defaults.double(forKey: "colorChroma") <= 1.0
-            {
-                defaults.set(1.4, forKey: "colorChroma")
-            }
-            if defaults.object(forKey: "colorTintStrength") == nil
-                || defaults.double(forKey: "colorTintStrength") <= 1.0
-            {
-                defaults.set(1.3, forKey: "colorTintStrength")
-            }
-            if defaults.object(forKey: "colorContrast") == nil {
-                defaults.set(1.1, forKey: "colorContrast")
-            }
-        }
-        let appearance =
-            AppTheme(rawValue: defaults.string(forKey: "appearance") ?? "") ?? .fallback
-        var c = ColorControls.default
-        if let raw = defaults.string(forKey: "colorScheme"),
-            let scheme = PaletteScheme(rawValue: raw)
-        {
-            c.scheme = scheme
-        }
-        c.hueShift = defaults.double(forKey: "colorHueShift")
-        if defaults.object(forKey: "colorChroma") != nil {
-            c.chroma = defaults.double(forKey: "colorChroma")
-        }
-        if defaults.object(forKey: "colorContrast") != nil {
-            c.contrast = defaults.double(forKey: "colorContrast")
-        }
-        if defaults.object(forKey: "colorTintStrength") != nil {
-            c.tintStrength = defaults.double(forKey: "colorTintStrength")
-        }
-        if defaults.object(forKey: "colorFollowImage") != nil {
-            c.followImage = defaults.bool(forKey: "colorFollowImage")
-        }
-        c.light = (appearance == .hue)
-        c.monochrome = (appearance == .mono)
-        return c
-    }
-
-    /// Update the OKLCH controls and re-resolve the theme immediately.
-    func setColorControls(_ c: ColorControls) {
-        let defaults = UserDefaults.standard
-        defaults.set(c.scheme.rawValue, forKey: "colorScheme")
-        defaults.set(c.hueShift, forKey: "colorHueShift")
-        defaults.set(c.chroma, forKey: "colorChroma")
-        defaults.set(c.contrast, forKey: "colorContrast")
-        defaults.set(c.tintStrength, forKey: "colorTintStrength")
-        defaults.set(c.followImage, forKey: "colorFollowImage")
-        colorControls = c
-        colorTheme = ColorResolver.theme(for: imagePalette, controls: c)
-        invalidateColorCaches()
-    }
-
-    /// The theme a given scheme would produce for the current image — powers the
-    /// palette tool's preview list.
-    func previewTheme(for scheme: PaletteScheme) -> ColorTheme {
-        var c = colorControls
-        c.scheme = scheme
-        return ColorResolver.theme(for: imagePalette, controls: c)
-    }
-
-    /// Choose whether text ink matches the theme or adapts to the background.
-    func setInkMode(_ m: InkMode) {
-        inkMode = m
-        UserDefaults.standard.set(m.rawValue, forKey: "inkMode")
-        invalidateColorCaches()
+    /// Switch appearance (light/dark for the `system` look; fixed for the rest).
+    func setAppearance(_ t: AppTheme) {
+        UserDefaults.standard.set(t.rawValue, forKey: "appearance")
+        rebuildLookTheme()
     }
 
     /// Choose Tinted or Clear Liquid Glass.
     func setGlassStyle(_ s: GlassStyle) {
         glassStyle = s
         UserDefaults.standard.set(s.rawValue, forKey: "glassStyle")
-    }
-
-    /// The cached analysis of `name`, computing and persisting it on first use.
-    func analysis(for name: String, image: NSImage? = nil) -> ImageAnalysis? {
-        guard !name.isEmpty else { return nil }
-        if let cached = storedAnalyses[name] { return cached }
-        guard let img = image ?? BackgroundAnalysis.thumb(name, max: 320) else { return nil }
-        let a = PaletteAnalyzer.analyze(img)
-        storedAnalyses[name] = a
-        PaletteStore.save(storedAnalyses)
-        return a
-    }
-
-    private var storedAnalyses: [String: ImageAnalysis] = PaletteStore.load()
-
-    /// Recompute the per-region appearance from the part of the artwork that is
-    /// *actually visible* — accounting for the aspect-fill crop and the quiet-band
-    /// pan — so adaptive text always contrasts what is truly behind it, whatever
-    /// the window size or focus state.
-    func refreshBackgroundRegions(force: Bool = false) {
-        // Skip unless the visible size really changed — the sidebar animation
-        // fires a geometry update every frame, and each refresh is several CI
-        // reads. `force` is used when the background/theme itself changes.
-        if !force,
-            abs(contentSize.width - lastRegionSize.width) < 8,
-            abs(contentSize.height - lastRegionSize.height) < 8
-        {
-            return
-        }
-        lastRegionSize = contentSize
-        guard !backgroundName.isEmpty,
-            let img = BackgroundAnalysis.thumb(backgroundName, max: 512)
-        else { return }
-        let appearance =
-            AppTheme(rawValue: UserDefaults.standard.string(forKey: "appearance") ?? "")
-            ?? .fallback
-        scheduleRegionAnalysis(
-            name: backgroundName, image: img, appearance: appearance, computeQuiet: false)
-    }
-
-    /// The global ink tool: pure white or near-black for text sitting over the
-    /// artwork behind `region`, from the graded appearance. Every adaptive text
-    /// surface should route through here so the choice is consistent.
-    func adaptiveInk(_ region: BgRegion = .center) -> Color {
-        guard !bgRegionAvg.isEmpty else { return .primary }
-        let appearance =
-            AppTheme(rawValue: UserDefaults.standard.string(forKey: "appearance") ?? "")
-            ?? .fallback
-        return BackgroundAnalysis.gradedLuminance(regionColor(region), theme: appearance) < 0.5
-            ? Color(white: 1.0) : Color(white: 0.04)
-    }
-
-    func shuffleBackground() {
-        guard backgrounds.count > 1 else { return }
-        if let pick = backgrounds.filter({ $0 != backgroundName }).randomElement() {
-            selectBackground(pick)
-        }
     }
 
     private func extractCitations(_ answer: String) -> [Citation] {

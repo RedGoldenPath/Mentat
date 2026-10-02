@@ -33,6 +33,7 @@ struct AskResponse: Decodable {
     let citations: [Citation]?
     let ungrounded: Int?
     let model: String?
+    let conversation: String?
     let meta: AnswerMeta?
 }
 
@@ -45,6 +46,7 @@ struct StreamEvent: Decodable {
     let ungrounded: Int?
     let model: String?
     let status: String?
+    let conversation: String?
     let meta: AnswerMeta?
 }
 
@@ -101,6 +103,19 @@ struct SettingSpec: Decodable, Identifiable {
     static let primaryKeys: Set<String> = ["model", "voice", "thinking"]
 }
 
+/// A file the reader attached to a message (drag-and-drop / paperclip).
+struct ChatAttachment: Identifiable, Hashable {
+    let id = UUID()
+    let name: String
+    let path: String
+    let bytes: Int
+    var label: String {
+        bytes > 0
+            ? "\(name) · \(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file))"
+            : name
+    }
+}
+
 enum ChatRole { case user, assistant, system }
 
 /// One row of the live transcript. A reference type + `@Observable`, so appending
@@ -120,6 +135,7 @@ enum ChatRole { case user, assistant, system }
     var progress: String
     var failed: Bool
     var pendingQuestion: String?
+    var attachmentNames: [String]
 
     init(
         role: ChatRole,
@@ -132,7 +148,8 @@ enum ChatRole { case user, assistant, system }
         streaming: Bool = false,
         progress: String = "",
         failed: Bool = false,
-        pendingQuestion: String? = nil
+        pendingQuestion: String? = nil,
+        attachmentNames: [String] = []
     ) {
         self.role = role
         self.text = text
@@ -145,6 +162,7 @@ enum ChatRole { case user, assistant, system }
         self.progress = progress
         self.failed = failed
         self.pendingQuestion = pendingQuestion
+        self.attachmentNames = attachmentNames
     }
 }
 

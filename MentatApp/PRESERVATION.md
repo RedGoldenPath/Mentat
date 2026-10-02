@@ -36,15 +36,17 @@ removal must be an explicit decision. The Python brain
 ## Chrome / interaction
 - `NavigationSplitView` sidebar (min 250 / ideal 320 / max 440); masonry tile ↔
   list toggle; Find filter; Pinned + Past sections; build stamp.
-- Background: quiet-band pan behind the wordmark; region sampling (left / centre /
-  right); graded-luminance ink; artwork continuation behind the sidebar.
+- Background: the **living sand** is the only canvas (Noir); every other look
+  (`System`/`Paper`/`Mono`) owns its own solid surface. Colour comes from the look,
+  never from a photo.
 - Glass family: pressable, glass button style, materialise, edge-to-edge, soft
   scroll edges, fade glass, frosted backing.
-- Hue / Noir toggle; drop-in menu transitions; command palette; settings sheet;
-  `/debug` panel; copy / re-ask / stop actions.
+- Light/Dark appearance (only affects `System`) + the **Looks** studio (`SurfaceLook`
+  System/Paper/Mono/Noir); the **Sand** studio (living/frequency/grain/glass);
+  drop-in menu transitions; command palette; settings sheet; `/debug` panel;
+  copy / re-ask / stop actions.
 
 ## Preserved specs (must not be lost)
-- `backgrounds/` catalog + `Resources/bg-*.jpg` + CREDITS.
 - The grid `@AppStorage` keys (`gridCols`, `gridGutter`, `gridMargin`,
   `gridBaseline`, `gridRows`, `headerHeight`, `gridScope`, `gridLines`,
   `gridLineOpacity`, `gridNumbers`) migrate into the LayoutGrid presets.
@@ -53,5 +55,10 @@ removal must be an explicit decision. The Python brain
 
 ## Checkpoint (every phase)
 build → launch → streamed answer → click + arrow-page → baseline-aligned columns
-→ Layout mode + presets + snap → grid feather + inspector → background switch →
-Hue/Noir → palette → `/debug`.
+→ Layout mode + presets + snap → grid feather + inspector → Looks (System/Paper/
+Mono/Noir) → Sand studio → Light/Dark → `/debug`.
+
+## Lean by construction
+The app ships **no photo assets**; the sand is procedural. The bundle stays ~9 MB
+and `verify.sh` fails if it exceeds 30 MB or if any `Resources/bg-*.jpg` returns.
+The token graph (`TokenCatalog`) is the single vocabulary, including `sand.*`.

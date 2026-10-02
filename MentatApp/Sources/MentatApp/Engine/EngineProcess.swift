@@ -4,6 +4,7 @@ import Foundation
 struct EngineHealth: Equatable {
     var online: Bool
     var model: String
+    var code: String = ""
     static let offline = EngineHealth(online: false, model: "")
 }
 
@@ -45,10 +46,22 @@ actor EngineProcess {
             let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
             return EngineHealth(
                 online: (obj?["ok"] as? Bool) ?? false,
-                model: (obj?["model"] as? String) ?? "")
+                model: (obj?["model"] as? String) ?? "",
+                code: (obj?["code"] as? String) ?? "")
         } catch {
             return .offline
         }
+    }
+
+    /// Ask a running engine to stop (graceful). Used to retire a stale engine so the
+    /// app always runs the current code after a restart.
+    func shutdown() async {
+        var req = URLRequest(url: Self.baseURL.appendingPathComponent("shutdown"))
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = Data("{}".utf8)
+        req.timeoutInterval = 5
+        _ = try? await URLSession.shared.data(for: req)
     }
 
     /// Launch the engine if it isn't already up, waiting briefly for it to come
@@ -56,7 +69,17 @@ actor EngineProcess {
     @discardableResult
     func ensureRunning(timeoutTicks: Int = 15) async -> EngineHealth {
         var h = await health()
-        if h.online { return h }
+        if h.online {
+            // A running engine may predate the current code (no hot reload). Retire it
+            // so this launch starts fresh on the current code (gunicorn/systemd-style:
+            // a fresh start must never silently reuse a stale process).
+            await shutdown()
+            for _ in 0..<10 {
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                if !(await health()).online { break }
+            }
+            h = .offline
+        }
         guard process == nil,
             FileManager.default.fileExists(atPath: python.path),
             FileManager.default.fileExists(atPath: server.path)

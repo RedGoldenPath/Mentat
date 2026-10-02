@@ -1,7 +1,7 @@
 import SwiftUI
 import AppKit
 
-// MARK: - Palettes (Hue = colour theory over the art, Noir = black & white)
+// MARK: - Palettes (Hue = colour theory over the art, Mono = black & white)
 
 struct Palette {
     let isDark: Bool
@@ -11,25 +11,6 @@ struct Palette {
     let text, textDim: Color
     let border, rim: Color
     let good, bad: Color
-
-    static let night = Palette(
-        isDark: true,
-        bg: Color(red: 0.086, green: 0.067, blue: 0.047),
-        bg2: Color(red: 0.153, green: 0.106, blue: 0.072),
-        panelTint: Color(red: 0.160, green: 0.110, blue: 0.070).opacity(0.26),
-        panelHi: Color(red: 0.220, green: 0.160, blue: 0.100),
-        sand: Color(red: 0.906, green: 0.827, blue: 0.671),
-        dune: Color(red: 0.784, green: 0.627, blue: 0.416),
-        terracotta: Color(red: 0.769, green: 0.439, blue: 0.235),
-        spice: Color(red: 0.918, green: 0.616, blue: 0.353),
-        gold: Color(red: 0.902, green: 0.753, blue: 0.475),
-        ibad: Color(red: 0.494, green: 0.651, blue: 0.780),
-        text: Color(red: 0.957, green: 0.914, blue: 0.839),
-        textDim: Color(red: 0.663, green: 0.541, blue: 0.400),
-        border: Color(red: 0.353, green: 0.251, blue: 0.157),
-        rim: .white,
-        good: Color(red: 0.565, green: 0.757, blue: 0.529),
-        bad: Color(red: 0.831, green: 0.443, blue: 0.376))
 
     static let day = Palette(
         isDark: false,
@@ -69,17 +50,11 @@ struct Palette {
         good: Color(white: 0.82),
         bad: Color(white: 0.58))
 
-    static func forTheme(_ t: AppTheme) -> Palette {
-        t == .hue ? .day : .mono
-    }
-
-    /// When the OKLCH theme is active, derive the whole palette from it, so every
-    /// static `pal.*` usage (headers, chips, labels, sheens, statuses) follows
-    /// the image hue. Falls back to the classic desert palette before the first
-    /// theme resolves.
-    static func forTheme(_ t: AppTheme, colorTheme: ColorTheme) -> Palette {
-        guard colorTheme != .placeholder else { return forTheme(t) }
-        let ct = colorTheme
+    /// Derive the whole chrome palette from the resolved theme, so every static
+    /// `pal.*` consumer (headers, chips, labels, sheens, statuses) is cohesive
+    /// with the look. The `SurfaceLook` owns colour; nothing is sampled.
+    static func from(_ ct: ColorTheme) -> Palette {
+        guard ct != .placeholder else { return .day }
         return Palette(
             isDark: !ct.isLight,
             bg: ct.background,
@@ -162,28 +137,24 @@ extension EnvironmentValues {
 // MARK: - Appearance preference (in-app light/dark toggle)
 
 enum AppTheme: String, CaseIterable, Identifiable {
-    case hue, mono            // Hue = colour theory over the art · Noir = contrasty B&W
-    static let fallback = AppTheme.mono
+    /// Light/dark appearance. It only matters for the `system` look — `paper`
+    /// is always light, `mono`/`sand` always dark. The look owns colour.
+    case light, dark
+    static let fallback = AppTheme.dark
     var id: String { rawValue }
-    var label: String { self == .mono ? "Noir" : "Hue" }
-    var colorScheme: ColorScheme { self == .hue ? .light : .dark }
-    var symbol: String { self == .hue ? "paintpalette.fill" : "circle.lefthalf.filled" }
-    var next: AppTheme { self == .hue ? .mono : .hue }
+    var label: String { self == .dark ? "Dark" : "Light" }
+    var colorScheme: ColorScheme { self == .light ? .light : .dark }
+    var symbol: String { self == .light ? "sun.max" : "moon" }
+    var next: AppTheme { self == .light ? .dark : .light }
 
-    /// Migrates the retired "light" value so existing preferences keep working.
+    /// Migrates the retired "hue"/"mono" values so existing preferences keep working.
     init?(rawValue: String) {
         switch rawValue {
-        case "hue", "light": self = .hue
-        case "mono": self = .mono
+        case "light", "hue": self = .light
+        case "dark", "mono": self = .dark
         default: return nil
         }
     }
 }
 
-private struct AppThemeKey: EnvironmentKey { static let defaultValue = AppTheme.mono }
-extension EnvironmentValues {
-    var appTheme: AppTheme {
-        get { self[AppThemeKey.self] }
-        set { self[AppThemeKey.self] = newValue }
-    }
-}
+

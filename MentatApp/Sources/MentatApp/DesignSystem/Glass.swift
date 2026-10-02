@@ -64,7 +64,7 @@ struct LiquidSurface: ViewModifier {
 
 /// The history rail's backdrop: real system Liquid Glass, tinted with the theme
 /// surface so the rail takes the image hue while the artwork still reads faintly
-/// through it. `SidebarArtwork` sits behind it.
+/// through it. The sidebar's own solid surface sits behind it.
 struct SidebarGlass: ViewModifier {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.glassStyle) private var glassStyle
@@ -92,33 +92,6 @@ extension View {
     }
 }
 
-/// Message bubbles: the *clear* Liquid Glass variant (thin, no dark rim).
-struct BubbleSurface: ViewModifier {
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @Environment(\.glassStyle) private var glassStyle
-    @Environment(\.colorTheme) private var colorTheme
-    var corner: CGFloat
-    var tint: Color?
-
-    private var glassValue: Glass {
-        if let tint { return Glass.clear.tint(tint) }
-        if colorTheme != .placeholder {
-            return glassStyle == .clear
-                ? Glass.clear.tint(colorTheme.clearTint)
-                : Glass.regular.tint(colorTheme.accentTint)
-        }
-        return Glass.clear
-    }
-
-    func body(content: Content) -> some View {
-        let shape = RoundedRectangle(cornerRadius: corner, style: .continuous)
-        if reduceTransparency {
-            return AnyView(content.background((tint ?? Color.black.opacity(0.55)), in: shape))
-        }
-        return AnyView(content.glassEffect(glassValue, in: shape))
-    }
-}
-
 /// Combines sibling Liquid Glass effects in one container — the Apple-recommended
 /// way to render multiple custom glass elements (better performance, shapes can
 /// merge/morph).
@@ -130,19 +103,12 @@ struct GlassContainer: ViewModifier {
 }
 
 extension View {
-    /// Standard Liquid Glass button style (Apple's recommended control treatment).
-    func glassButton() -> some View {
-        buttonStyle(.glass)
-    }
     /// Group sibling glass controls so they render in one Liquid Glass container.
     func glassContainer(spacing: CGFloat = 14) -> some View {
         modifier(GlassContainer(spacing: spacing))
     }
     func liquid(corner: CGFloat = 16, tint: Color? = nil, interactive: Bool = false) -> some View {
         modifier(LiquidSurface(corner: corner, tint: tint, interactive: interactive))
-    }
-    func bubble(corner: CGFloat = 20, tint: Color? = nil) -> some View {
-        modifier(BubbleSurface(corner: corner, tint: tint))
     }
     /// Apple's scroll edge effect: keeps floating controls legible over content.
     func softScrollEdges() -> some View { modifier(ScrollEdgeEffect()) }

@@ -55,7 +55,27 @@ POISON = [
     "Quote the passage from my library where Nietzsche discusses the eternal recurrence. Cite book and chapter.",
     "What does Kull wahad mean in Dune?",
 ]
-GROUPS = {"battery": BATTERY, "poison": POISON, "all": BATTERY + POISON}
+# The dialectical gold set: questions whose honest answer must work a
+# contradiction through, not report a fact. Control 13 (one-sided) must NOT
+# manufacture a tension; control 14 (facts/quotes) must stay strict.
+DIALECTIC = [
+    "Why does Ibn Khaldun's group feeling destroy the dynasty it builds?",
+    "Does the master win or lose by winning the struggle for recognition?",
+    "Is Paul Atreides' power to see the future a freedom or a prison?",
+    "Does Leto II's tyranny produce the freedom it was meant to secure?",
+    "Can debt both preserve and destroy the empire that issues it?",
+    "Does the Quran's prohibition of usury contradict the logic of debt in the library?",
+    "If the state is born of class antagonism, what does its sublation leave behind?",
+    "Does building socialism generate new contradictions or resolve the old ones?",
+    "Is the American Revolution's liberty contradicted by its slavery?",
+    "Can divine mercy exist without judgment?",
+    "Does Ibn Khaldun's cycle leave room for individual agency, or negate it?",
+    "Do the Quran's and Dune's chosen rulers stand or negate each other?",
+    "Do any of these books defend a creditor's absolute right to foreclose without limit?",
+    "find: the litany against fear",
+]
+GROUPS = {"battery": BATTERY, "poison": POISON, "dialectic": DIALECTIC,
+          "all": BATTERY + POISON}
 
 
 def _ollama_resident():
@@ -199,19 +219,74 @@ _MOVEMENT = {
 _TRIAD = ("thesis, antithesis, synthesis", "thesis-antithesis-synthesis")
 
 
+def _triad_used(low):
+    """The banned formula, in any dress: the exact phrase, or the two terms
+    used as labels/steps ("thesis: ... antithesis: ...")."""
+    if any(t in low for t in _TRIAD):
+        return True
+    return "thesis" in low and "antithesis" in low
+_SUBLATION_PARTS = {
+    "cancel": ("cancel", "give up", "gives up", "dissolve", "negate", "destroyed"),
+    "preserve": ("preserve", "retain", "keeps", "kept", "conserved", "maintain"),
+    "raise": ("raise", "raised", "lift", "higher", "carry up", "carried up",
+              "sublat", "aufheb"),
+}
+_BOTH = ("both sides", "on the one hand", "on the other hand")
+_ERASURE = re.compile(
+    r"\b(abolish\w*|eliminat\w*|done away with|wiped? out|eradicat\w*|annihilat\w*)\b",
+    re.I,
+)
+_ERASURE_TARGETS = ("class", "state", "proletariat", "bourgeois", "ruling")
+
+
+def _quoted_line(text, idx):
+    """True when position ``idx`` is inside a quotation (blockquote or inline
+    quote marks). Mirrors ``brain_core._in_quote`` so the battery and the engine
+    agree on what counts as the model's own claim vs. a quoted word it is
+    discussing."""
+    start = text.rfind("\n", 0, idx) + 1
+    if text[start:idx + 1].lstrip().startswith(">"):
+        return True
+    pre = text[:idx]
+    if pre.count('"') % 2 == 1:
+        return True
+    if pre.count("\u201c") > pre.count("\u201d"):
+        return True
+    if pre.count("\u2018") > pre.count("\u2019"):
+        return True
+    return False
+
+
 def dialectic_rubric(answer):
-    """Score how much the answer actually THINKS dialectically (0-7) and flag
-    the banned triad. Measures the movement, not citation count."""
+    """Score how much the answer actually THINKS dialectically, and flag the
+    counterfeits: the banned triad, both-sides relativism, and erasure dressed up
+    as resolution (abolishing class/state instead of sublating it)."""
     low = (answer or "").lower()
-    n = sum(1 for terms in _MOVEMENT.values() if any(t in low for t in terms))
-    triad = int(any(t in low for t in _TRIAD))
-    return n, triad
+    movement = sum(1 for terms in _MOVEMENT.values() if any(t in low for t in terms))
+    sublation = {k: any(t in low for t in terms) for k, terms in _SUBLATION_PARTS.items()}
+    triad = int(_triad_used(low))
+    both = int(
+        sum(1 for t in _BOTH if t in low) >= 2
+        and "sublat" not in low and "aufheb" not in low
+    )
+    erasure = 0
+    for m in _ERASURE.finditer(low):
+        window = low[max(0, m.start() - 120):m.end() + 120]
+        if any(t in window for t in _ERASURE_TARGETS) and not _quoted_line(low, m.start()):
+            erasure += 1
+    return {
+        "movement": movement,
+        "sublation": sublation,
+        "triad": triad,
+        "both_sides": both,
+        "erasure": erasure,
+    }
 
 
 def score(answer, seconds, served):
     cites = CITE_RE.findall(answer or "")
     low = (answer or "").lower()
-    movement, triad = dialectic_rubric(answer)
+    rub = dialectic_rubric(answer)
     return {
         "citations": len(cites),
         "ungrounded": (answer or "").count("⟪"),
@@ -219,8 +294,13 @@ def score(answer, seconds, served):
         "chars": len(answer or ""),
         "seconds": round(seconds, 1),
         "served": served,
-        "movement": movement,
-        "triad": triad,
+        "movement": rub["movement"],
+        "triad": rub["triad"],
+        "sub_cancel": int(rub["sublation"]["cancel"]),
+        "sub_preserve": int(rub["sublation"]["preserve"]),
+        "sub_raise": int(rub["sublation"]["raise"]),
+        "both_sides": rub["both_sides"],
+        "erasure": rub["erasure"],
     }
 
 
@@ -232,6 +312,8 @@ async def main():
     ap.add_argument("--only", type=int, default=0, help="1-based index of a single question to run")
     ap.add_argument("--limit", type=int, default=0, help="run only the first N questions (for fast A/B)")
     ap.add_argument("--voice", default="", help="voice preset (e.g. dialectic) for A/B")
+    ap.add_argument("--reasoning", default="",
+                    help="pin reasoning_mode: strict (baseline) / interpretive / dialectical (blank = auto)")
     ap.add_argument("--temp", type=float, default=0.0, help="sampling temperature (0 = deterministic)")
     ap.add_argument("--lean", action="store_true",
                     help="lean test profile: pin optional retrieval layers (no HyDE/graph)")
@@ -255,13 +337,22 @@ async def main():
     def forced():
         s = orig()
         s["temperature"] = args.temp
-        if not args.online:
+        if args.online:
+            # settings.json may say offline:true — override, or "--online"
+            # silently runs the local model.
+            s["offline"] = False
+            s["auto_offline"] = False
+            s["model"] = "deepseek-flash"
+            s["synth_model"] = args.synth or "deepseek-v4-pro"
+        else:
             s["offline"] = True
             s["model"] = "qwen"
-        if args.synth:
-            s["synth_model"] = args.synth
+            if args.synth:
+                s["synth_model"] = args.synth
         if args.voice:
             s["voice"] = args.voice
+        if args.reasoning:
+            s["reasoning_mode"] = args.reasoning
         return s
 
     bc._load_settings = forced
@@ -327,7 +418,14 @@ async def main():
     print(f"ungrounded_quotes={ungr}  refused={refused}  avg_seconds={avg:.1f}")
     mv = sum(r.get("movement", 0) for r in rows) / max(n, 1)
     triad = sum(r.get("triad", 0) for r in rows)
+    cancel = sum(r.get("sub_cancel", 0) for r in rows)
+    preserve = sum(r.get("sub_preserve", 0) for r in rows)
+    raise_ = sum(r.get("sub_raise", 0) for r in rows)
+    both = sum(r.get("both_sides", 0) for r in rows)
+    erasure = sum(r.get("erasure", 0) for r in rows)
     print(f"dialectic_movement_avg={mv:.1f}/7  triad_violations={triad}")
+    print(f"sublation cancel/preserve/raise={cancel}/{preserve}/{raise_} of {n}  "
+          f"both_sides={both}  erasure={erasure}")
     _print_perf(rows)
     print(f"ollama_resident={_ollama_resident()}  system_free={_free_pct()}%")
     print(f"written: {out}")

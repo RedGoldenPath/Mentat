@@ -33,3 +33,8 @@ train/.venv/
 # Swift build output
 MentatApp/.build/
 MentatApp/Mentat.app/
+
+# Perf snapshot additions
+mentat2_data/
+SandLab/.build/
+SandLab/SandLab.app/

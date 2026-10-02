@@ -9,7 +9,7 @@ import CoreText
 /// - a fixed book measure per column, hard-capped at the 55-char ceiling;
 /// - `linesPerColumn` lines per column, filled top-to-bottom (columns are read
 ///   down, then across — *not* balanced);
-/// - columns multiply 1 → 2 → 3 only when the text is long enough to spill past
+/// - columns multiply 1 → up to `maxColumns` only when the text spills past
 ///   a full column, then the text paginates;
 /// - a lone column that fits one page is centred.
 struct PageEngine: Equatable {
