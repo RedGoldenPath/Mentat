@@ -120,6 +120,13 @@ Presets (lab): **Still · Wander · Breezy · Elegant (=`.sand`)**.
 
 ## 4 · Decision log (appended, dated)
 
+- **2026-10-01 · Perf pass — half-res light, adaptive cadence, dead code out.** The
+  `sand_light` pass now renders at **half the drawable and is upscaled** (it's a soft
+  wash sampled linearly, so no visible loss) — ~4× cheaper, the single biggest GPU win
+  after the earlier lean rewrite. Cadence is **120 fps while interacting / 60 at rest /
+  paused when hidden or Reduce-Motion** (never 30; the sim stays alive at rest per §0).
+  `bloomIterations` now rebuilds the chain (was frozen at last resize); the dead `beamAt`
+  static is removed. No change to the look.
 - **2026-10-01 · Baseline from SandLab snapshot (sandV26).** The reader's tuned
   SandLab values (snapshot `SandLab/sandlab-baseline.json`, from
   `~/Library/Application Support/SandLab/settings.json`) are now baked into the

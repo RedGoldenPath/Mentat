@@ -126,6 +126,14 @@ def v1(name: str) -> sqlite3.Connection:
     if name not in conns:
         path = config.V1_STORAGE / f"{name}.db"
         con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        # Read-only tuning: memory-map + a bigger page cache so the 590 MB library
+        # scans don't thrash; never writes (query_only).
+        for p in ("PRAGMA mmap_size=268435456", "PRAGMA cache_size=-131072",
+                  "PRAGMA temp_store=MEMORY", "PRAGMA query_only=1"):
+            try:
+                con.execute(p)
+            except Exception:
+                pass
         con.row_factory = sqlite3.Row
         if name == "vec":
             import sqlite_vec
@@ -140,6 +148,17 @@ def v2() -> sqlite3.Connection:
     con = getattr(_local, "v2", None)
     if con is None:
         con = sqlite3.connect(str(config.V2_DB), check_same_thread=False)
+        # WAL + NORMAL synchronous: a dialectic ask did 15–25 commits (telemetry,
+        # claims, attacks, session) — each an fsync under the default rollback
+        # journal. WAL makes those cheap and lets readers/writers coexist; the
+        # busy_timeout stops concurrent-write failures from being silently dropped.
+        for p in ("PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL",
+                  "PRAGMA busy_timeout=5000", "PRAGMA temp_store=MEMORY",
+                  "PRAGMA mmap_size=268435456", "PRAGMA cache_size=-65536"):
+            try:
+                con.execute(p)
+            except Exception:
+                pass
         con.row_factory = sqlite3.Row
         con.executescript(SCHEMA)
         for stmt in _MEM_MIGRATIONS:
@@ -167,6 +186,12 @@ def ctx() -> sqlite3.Connection:
     if con is None:
         import sqlite_vec
         con = sqlite3.connect(str(config.CTX_DB), check_same_thread=False)
+        for p in ("PRAGMA busy_timeout=5000", "PRAGMA mmap_size=268435456",
+                  "PRAGMA cache_size=-65536", "PRAGMA temp_store=MEMORY"):
+            try:
+                con.execute(p)
+            except Exception:
+                pass
         con.row_factory = sqlite3.Row
         con.enable_load_extension(True)
         sqlite_vec.load(con)

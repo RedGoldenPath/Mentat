@@ -93,8 +93,11 @@ public final class SandPipeline: NSObject, MTKViewDelegate {
     private var bloomDown: [MTLTexture] = []
     private var bloomUp: [MTLTexture] = []
     private var bloomOut: MTLTexture?
-    // Volumetric light: render supersampled → temporally accumulated (light-only).
-    private var lightNow: MTLTexture?      // the light for this frame (1×, one pass)
+    // The light is a soft wash sampled linearly by dust + display, so it's
+    // rendered at a fraction of the drawable and upscaled — ~4× cheaper, no
+    // visible loss. (This single pass was the dominant GPU cost.)
+    private var lightNow: MTLTexture?
+    private let lightScale: Float = 0.5
     private var dustTarget: MTLTexture?
     private var dither: MTLTexture?
     private var dustBuffer: MTLBuffer?
@@ -102,6 +105,7 @@ public final class SandPipeline: NSObject, MTKViewDelegate {
     private var dustCount = 0
 
     private var drawSize = (w: 0, h: 0)
+    private var bloomLevelsBuilt = -1
     private var lastTime = CACurrentMediaTime()
     private var elapsed: Float = 0
     private var fpsTimer: Double = 0
@@ -215,16 +219,18 @@ public final class SandPipeline: NSObject, MTKViewDelegate {
     private func syncTextures(drawableSize: CGSize) {
         let w = max(1, Int(drawableSize.width))
         let h = max(1, Int(drawableSize.height))
-        guard w != drawSize.w || h != drawSize.h else { return }
+        let levels = max(1, min(6, Int(config.bloomIterations)))
+        guard w != drawSize.w || h != drawSize.h || levels != bloomLevelsBuilt else { return }
+        let sizeChanged = w != drawSize.w || h != drawSize.h
         drawSize = (w, h)
-        dustTarget = makeRenderTex(w, h, .rgba16Float)
+        bloomLevelsBuilt = levels
+        if sizeChanged { dustTarget = makeRenderTex(w, h, .rgba16Float) }
 
         let aspect = max(1.0, Double(w) / Double(h))
         let bH = 192
         let bW = max(32, Int(Double(bH) * aspect))
         bloomDown.removeAll(); bloomUp.removeAll()
         var bw = bW, bh = bH
-        let levels = max(1, min(6, Int(config.bloomIterations)))
         for _ in 0...levels {
             guard bw >= 2, bh >= 2 else { break }
             bloomDown.append(makeTex(bw, bh, .rgba16Float)!)
@@ -233,7 +239,12 @@ public final class SandPipeline: NSObject, MTKViewDelegate {
         }
         bloomOut = makeTex(bW, bH, .rgba16Float)
 
-        lightNow = makeRenderTex(w, h, .rgba16Float)   // 1× — one cheap pass
+        // Half-res light (soft, upscaled) — the dominant GPU pass, ~4× cheaper.
+        let lw = max(1, Int(Float(w) * lightScale))
+        let lh = max(1, Int(Float(h) * lightScale))
+        if sizeChanged || lightNow == nil {
+            lightNow = makeRenderTex(lw, lh, .rgba16Float)
+        }
     }
 
     public nonisolated func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}

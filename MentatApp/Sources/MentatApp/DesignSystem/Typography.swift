@@ -5,17 +5,20 @@ import CoreText
 /// typographic *measure* rules (column width, lines-per-column, column ceiling)
 /// that the paginator obeys. Kept free of SwiftUI so it can be unit-tested.
 enum TextStyle {
+    // Compiled once (not per message) — this ran on every transcript rebuild.
+    nonisolated(unsafe) private static let refPatterns: [NSRegularExpression] = [
+        try! NSRegularExpression(pattern: #"\n#{1,6}\s*References\b[\s\S]*$"#),
+        try! NSRegularExpression(pattern: #"\n\*\*References\*\*[\s\S]*$"#),
+        try! NSRegularExpression(pattern: #"\n\s*References\s*\n[\s\S]*$"#),
+    ]
+
     /// Strip a trailing auto-generated `References` block from an answer.
     static func clean(_ raw: String) -> String {
         var t = raw
-        let patterns = [
-            #"\n#{1,6}\s*References\b[\s\S]*$"#,
-            #"\n\*\*References\*\*[\s\S]*$"#,
-            #"\n\s*References\s*\n[\s\S]*$"#,
-        ]
-        for p in patterns {
-            if let r = t.range(of: p, options: .regularExpression) {
-                t = String(t[..<r.lowerBound])
+        for r in refPatterns {
+            let range = NSRange(t.startIndex..<t.endIndex, in: t)
+            if let m = r.firstMatch(in: t, range: range), let rr = Range(m.range, in: t) {
+                t = String(t[..<rr.lowerBound])
                 break
             }
         }

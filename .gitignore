@@ -38,3 +38,15 @@ MentatApp/Mentat.app/
 mentat2_data/
 SandLab/.build/
 SandLab/SandLab.app/
+
+# Playwright / browser session
+corpus/.pw-zlib/
+corpus/tmp/
+corpus/logs/
+
+# Large / generated index backups
+storage.bak.*/
+
+# Torrent stack runtime state (credentials, logs, downloaded lists)
+torrent/qbittorrent/qBittorrent/
+torrent/gluetun/servers/

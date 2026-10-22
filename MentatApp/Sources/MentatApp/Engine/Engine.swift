@@ -755,10 +755,12 @@ import SwiftUI
         UserDefaults.standard.set(s.rawValue, forKey: "glassStyle")
     }
 
+    // Compiled once (was recompiled per message on every transcript rebuild).
+    nonisolated(unsafe) private static let citationRegex =
+        try! NSRegularExpression(pattern: "\\(([^()\\n]{3,90}) · ([^()\\n]{1,90})\\)")
+
     private func extractCitations(_ answer: String) -> [Citation] {
-        guard
-            let re = try? NSRegularExpression(pattern: "\\(([^()\\n]{3,90}) · ([^()\\n]{1,90})\\)")
-        else { return [] }
+        let re = Self.citationRegex
         var seen = Set<String>()
         var out: [Citation] = []
         let ns = answer as NSString

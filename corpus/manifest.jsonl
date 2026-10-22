@@ -1,0 +1,5 @@
+# Mentat corpus manifest — one JSON object per line.
+# id · subject · author · work · lang · url · dest (relative to books/) · format · license
+{"id":"lenin-cw-01","subject":"marxism-leninism","author":"Lenin","work":"Collected Works, Volume 1","lang":"en","format":"pdf","license":"PD/MIA","url":"https://www.marxists.org/archive/lenin/works/cw/pdf/lenin-cw-vol-01.pdf","dest":"marxism-leninism/russia-ussr/lenin/Collected Works/Lenin - Collected Works vol 01.pdf"}
+{"id":"mao-sw-01","subject":"marxism-leninism","author":"Mao Zedong","work":"Selected Works, Volume 1","lang":"en","format":"epub","license":"PD/MIA","url":"https://www.marxists.org/ebooks/mao/mao-selected-works-1.epub","dest":"marxism-leninism/china/mao/Selected Works/Mao - Selected Works vol 1.epub"}
+{"id":"xi-gov-01","subject":"marxism-leninism","author":"Xi Jinping","work":"The Governance of China, Volume 1","lang":"en","format":"pdf","license":"FLP (personal use)","url":"https://archive.org/download/xijinpingthegovernanceofchinavolume1/Xi%20Jinping%20The%20Governance%20Of%20China%20volume%201.pdf","dest":"marxism-leninism/china/xi-jinping/Xi Jinping - The Governance of China (vol 1).pdf"}

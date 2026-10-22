@@ -85,7 +85,14 @@ def _mentions_library(q):
     return bool(toks & lib)
 
 
+from functools import lru_cache
+
+
+@lru_cache(maxsize=256)
 def classify(query, embed=True) -> tuple[str, str]:
+    # Cached: the pipeline classifies the query once to decide whether to condense
+    # and `route()` classifies again — without the cache the embedding tie-break was
+    # recomputed twice per request. Pure function of (query, embed)."""
     ql = (query or "").lower().strip()
     toks = _tokens(ql)
     if ql.startswith("find:") or any(p in ql for p in _STRICT_PHRASES) or (toks & set(_STRICT_WORDS)):

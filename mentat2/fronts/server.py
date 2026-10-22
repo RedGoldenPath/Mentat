@@ -460,11 +460,18 @@ def main():
     atexit.register(_cleanup)
     print(f"Mentat v2 engine on http://{a.host}:{a.port} · code {code_id()} · pid {os.getpid()}",
           flush=True)
-    if config.WARMUP and config.load_settings().get("profile") == "local":
+    if config.WARMUP:
         def _warm():
+            prof = config.load_settings().get("profile")
             try:
-                r = gateway.warmup()
-                print(f"warmup: {r}", flush=True)
+                if prof == "local":
+                    r = gateway.warmup()                 # writer + embedder
+                    print(f"warmup: {r}", flush=True)
+                else:
+                    # online never loads the local writer — warm only the embedder
+                    # so the first retrieval embed isn't a cold model load.
+                    ok = gateway.warm_embed()
+                    print(f"warmup: embed={ok}", flush=True)
             except Exception as e:
                 print(f"warmup failed: {e}", flush=True)
 

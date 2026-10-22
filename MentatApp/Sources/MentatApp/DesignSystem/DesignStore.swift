@@ -3,7 +3,7 @@ import Observation
 
 /// Owns the live `DesignTokens`, persisted to UserDefaults and mirrored into
 /// `DesignTokens.current` so the static design helpers see edits immediately.
-@Observable final class DesignStore {
+@MainActor @Observable final class DesignStore {
     private static let key = "designTokens"
 
     var tokens: DesignTokens {
@@ -234,9 +234,20 @@ import Observation
         tokens = next
     }
 
+    @ObservationIgnored private var persistTask: Task<Void, Never>?
+
+    /// Debounced: dragging a sand/design slider fires `tokens.didSet` many times a
+    /// second. Encoding the whole token blob + writing UserDefaults on *every*
+    /// tick was a per-frame disk/CPU cost — coalesce to one write after the drag
+    /// settles.
     private func persist() {
-        if let data = try? JSONEncoder().encode(tokens) {
-            UserDefaults.standard.set(data, forKey: Self.key)
+        persistTask?.cancel()
+        persistTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            guard !Task.isCancelled, let self else { return }
+            if let data = try? JSONEncoder().encode(self.tokens) {
+                UserDefaults.standard.set(data, forKey: Self.key)
+            }
         }
     }
 }

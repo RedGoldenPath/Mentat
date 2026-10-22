@@ -113,6 +113,9 @@ struct DropdownRow<Content: View>: View {
 struct MessageRow: View {
     let message: ChatMessage
     var engine: Engine
+    /// The chat content width, passed in (not read from `engine.contentSize`) so
+    /// the row doesn't observe it — otherwise every resize re-rendered every row.
+    var contentSize: CGFloat = 0
     @AppStorage("gridCols") private var gridCols = 9
     @AppStorage("gridGutter") private var gridGutter = 16.0
     @AppStorage("gridMargin") private var gridMargin = 20.0
@@ -277,7 +280,7 @@ struct MessageRow: View {
     private var assistant: some View {
         let _ = Perf.count("row.assistant")
         let m = CGFloat(gridMargin)
-        let contentW = max(200, engine.contentSize.width - 2 * m)
+        let contentW = max(200, contentSize - 2 * m)
         // the bubble spans C1…C9; the text sits inside a gutter of padding so it
         // never runs into the rounded edges (the columns share the same gutter)
         let hPad = CGFloat(gridGutter)
@@ -1048,7 +1051,8 @@ struct ChatView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 16) {
                     ForEach(engine.messages) { m in
-                        MessageRow(message: m, engine: engine)
+                        MessageRow(message: m, engine: engine,
+                                   contentSize: engine.contentSize.width)
                             .id(m.id)
                             .transition(.scale(scale: 0.97).combined(with: .opacity))
                     }
@@ -1361,7 +1365,13 @@ struct RootView: View {
     @State private var sandMotion = SandMotionStore()
     /// The detail's frame measured in global space — the sand canvas fills it,
     /// so the pointer maps to the pixel under the cursor's tip.
-    @State private var sandFrame: CGRect = .zero
+    // Plain reference box (NOT @Observable): the sand frame updates on every
+    // layout, so storing it in @State re-rendered the whole RootView mid-layout,
+    // which (inside the inspector's animation context) re-entered AppKit layout
+    // and crashed from `_postWindowNeedsUpdateConstraints`. A non-observed box
+    // lets the hover mapping read the latest frame without invalidating the tree.
+    final class SandFrameBox { var frame: CGRect = .zero }
+    @State private var sandBox = SandFrameBox()
     @State private var designStore: DesignStore
     @State private var inspectorStore: InspectorStore
     @State private var appStore: AppStore
@@ -1634,21 +1644,24 @@ struct RootView: View {
                                 .transition(.move(edge: .trailing).combined(with: .opacity))
                         }
                     }
+                    // Scope the inspector animation to this HStack only — never the
+                    // whole detail (which holds the sand GeometryReader + many
+                    // onChange). An animated layout around those re-entered AppKit.
+                    .animation(Anim.snappy, value: inspectorStore.visible)
                 }
                 .background(GeometryReader { g in
                     Color.clear
-                        .onAppear { sandFrame = g.frame(in: .global) }
-                        .onChange(of: g.frame(in: .global)) { _, f in sandFrame = f }
+                        .onAppear { sandBox.frame = g.frame(in: .global) }
+                        .onChange(of: g.frame(in: .global)) { _, f in sandBox.frame = f }
                 })
-                .animation(Anim.snappy, value: inspectorStore.visible)
                 .onContinuousHover(coordinateSpace: .global) { phase in
                     // Map the pointer into the detail's frame so the obstacle
                     // sits under the cursor tip.
                     switch phase {
                     case .active(let p):
-                        let s = sandFrame.size.width < 2 ? engine.contentSize : sandFrame.size
-                        sandMotion.setPointer(CGPoint(x: p.x - sandFrame.minX,
-                                                      y: p.y - sandFrame.minY), in: s)
+                        let f = sandBox.frame
+                        let s = f.size.width < 2 ? engine.contentSize : f.size
+                        sandMotion.setPointer(CGPoint(x: p.x - f.minX, y: p.y - f.minY), in: s)
                     case .ended: sandMotion.clearPointer()
                     }
                 }

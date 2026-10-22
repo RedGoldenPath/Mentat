@@ -4,12 +4,35 @@ route -> retrieve -> [dialectical: claims -> attacks -> loop] -> write -> verify
  -> memory.  Telemetry per stage via the graph runner.
 """
 from __future__ import annotations
+import re
 import time
 import uuid
 from . import (config, router, retrieve, claims as claims_mod, attacks as attacks_mod,
                loop, writer, verify, telemetry, memory, gateway, store, extract)
 from .graph import Graph
 from .contracts import Session
+
+
+# Quote-hunt scaffolding: strip the request ("find me …", "show me …") and the noun
+# ("quotes", "passages", …) so the subject alone is searched. Without this the hunt
+# looks for the literal string "find me quotes on X", which never matches, and the
+# writer is handed an empty EVIDENCE block.
+_QUOTE_SCRUB = re.compile(
+    r"^\s*(?:(?:can|could|would)\s+you\s+)?"
+    r"(?:(?:find|show|give|get|pull|search|fetch|list)\s+(?:me|us)?\s*)?"
+    r"(?:(?:any|some|all|the|a|an)\s+)?"
+    r"(?:quotes?|quotations?|passages?|verbatim|exact\s+words?|exact\s+quotes?)\s*"
+    r"(?:(?:on|about|regarding|re|for|mentioning|related\s+to|where)\s+)?"
+    r"(?:from\s+)?",
+    re.I,
+)
+
+
+def _quote_subject(query: str) -> str:
+    """The subject of a "find me quotes on X" style request — `X`, not the whole ask."""
+    s = _QUOTE_SCRUB.sub(" ", query or "", count=1)
+    s = re.sub(r"\s+", " ", s).strip(" ?.,:;!\"'")
+    return s
 
 
 # ---- stages ---------------------------------------------------------------
@@ -131,8 +154,16 @@ def _retrieve(s):
     quote_intent = any(w in ql for w in
                        ("find", "quote", "litany", "passage", "verbatim", "exact words"))
     if route.mode == "strict" and quote_intent:
-        # span-anchored hunt → citations carry real page numbers (RAGFlow-style)
-        s["passages"] = retrieve.span_hunt(s["query"], limit=int(s["settings"].get("top_k", 6)))
+        # span-anchored hunt → citations carry real page numbers (RAGFlow-style).
+        # Hunt the *subject* ("X"), not the raw "find me quotes on X" — and if the
+        # phrase isn't verbatim (typo, OCR drift, paraphrase) the lexical hunt finds
+        # nothing, so fall back to semantic+BM25 retrieval rather than answering "the
+        # EVIDENCE field is empty" when the library plainly has material.
+        subj = _quote_subject(s["query"]) or s["query"]
+        s["passages"] = retrieve.span_hunt(subj, limit=int(s["settings"].get("top_k", 6)))
+        if not s["passages"]:
+            s["passages"] = retrieve.retrieve(subj, k=int(s["settings"].get("top_k", 8)),
+                                              budget_chars=route.context_budget)
     else:
         s["passages"] = retrieve.retrieve(rq, k=int(s["settings"].get("top_k", 8)),
                                           budget_chars=route.context_budget)

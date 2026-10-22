@@ -224,6 +224,19 @@ This creates a file in `~/Library/LaunchAgents/`. Turn it off with
 `brain schedule off`. First run after enabling will index the whole backlog
 (deepseek-fast if the key is set).
 
+## Auto-index on drop (watcher)
+
+`brain watch on` installs a launchd agent that watches the vault with macOS
+FSEvents and indexes a document the moment it lands — no timers, no sweeps;
+when nothing is happening it does nothing. Drop a PDF/EPUB/markdown file into
+the vault and it is indexed within a few seconds (it waits for a large copy to
+settle first, so a half-copied file is never read).
+
+`brain watch off` stops it; `brain watch` (or `watch status`) reports whether it
+is running, the vault root, and the last few log lines. The log is
+`app/watch.log`. This needs the `watchdog` package (already in `pyproject.toml`).
+
+
 ## Auto-indexing behavior
 
 Small additions (up to 8 files or ~2 MB) are auto-indexed before answering.

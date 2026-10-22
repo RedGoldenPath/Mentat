@@ -25,7 +25,10 @@ def _ollama():
     global _OLLAMA
     if _OLLAMA is None:
         import ollama
-        _OLLAMA = ollama.Client(host=config.OLLAMA_HOST)
+        try:
+            _OLLAMA = ollama.Client(host=config.OLLAMA_HOST, timeout=120)  # no infinite hangs
+        except TypeError:
+            _OLLAMA = ollama.Client(host=config.OLLAMA_HOST)
     return _OLLAMA
 
 
@@ -266,7 +269,8 @@ def embed(texts, profile: str = "local"):
     texts = list(texts)
     c = _ollama()
     try:
-        r = c.embed(model=config.OLLAMA_EMBED_MODEL, input=texts)
+        r = c.embed(model=config.OLLAMA_EMBED_MODEL, input=texts,
+                    keep_alive=config.LOCAL_KEEP_ALIVE)   # keep the embedder warm
         embs = _attr(r, "embeddings")
         if embs:
             return np.asarray(embs, dtype=np.float32)
@@ -274,9 +278,21 @@ def embed(texts, profile: str = "local"):
         pass
     out = []
     for t in texts:
-        r = c.embeddings(model=config.OLLAMA_EMBED_MODEL, prompt=t)
+        r = c.embeddings(model=config.OLLAMA_EMBED_MODEL, prompt=t,
+                         keep_alive=config.LOCAL_KEEP_ALIVE)
         out.append(np.asarray(_attr(r, "embedding"), dtype=np.float32))
     return np.vstack(out)
+
+
+def warm_embed():
+    """Preload just the embedder (used in the online profile, which never loads the
+    local writer) so the first retrieval embed isn't a cold model load."""
+    try:
+        _ollama().embed(model=config.OLLAMA_EMBED_MODEL, input=["warmup"],
+                        keep_alive=config.LOCAL_KEEP_ALIVE)
+        return True
+    except Exception:
+        return False
 
 
 def rerank(query: str, docs: list[str]) -> list[float]:

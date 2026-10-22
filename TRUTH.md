@@ -121,6 +121,12 @@ Online: DeepSeek `deepseek-flash` / `deepseek-v4-pro` (reasoning; `thinking:{typ
 `qwen2.5:7b`. Offline writer default: **`qwen3.5:35b-a3b-nvfp4`** (MoE, ~3B active,
 MLX/FP4) — best offline latency; fallback `qwen3.8:27b-mlx`.
 
+**Upgrade plan (2026-10-02, §11):** A/B `qwen3.6:35b-a3b` (or `qwen3.8:35b-a3b` if released)
+as the offline writer — same 3B-active MoE shape, better record, ~same speed. The dense
+`qwen3.8:27b-mlx` stays an **opt-in specialist** (picker/vision), **never co-resident** with
+the writer (22 + 18 GB → swap). Measured here: MoE 22 GB / 123.5 tok/s; dense 27B 18 GB /
+65.6 tok/s.
+
 **Registry (data, per model):** context / reasoning / sampling / structured / cache /
 usage / job_overrides. Verified against docs: Ollama `think` ∈ `bool|low|medium|high|max`;
 `format` = `json` **or a JSON schema**; `keep_alive:0` unloads; usage
@@ -172,6 +178,38 @@ source / paper); record it here; verify with a test. Novel work may borrow sub-p
 
 ## 11 · Decisions log
 
+- 2026-10-02: **Local-model fit study + upgrade plan (not yet executed).** Reviewed the
+  machine, the engine's job profile, and the open-weight field (Oct 2026) against the
+  question "is a better local model available?". **Machine (measured live):** M5 Max · 48 GB
+  · ~614 GB/s · 40-core GPU · macOS 27.0 · Ollama 0.35.0. **Throughput (100% GPU):**
+  `qwen3.5:35b-a3b-nvfp4` **123.5 tok/s** decode / 32.7 prompt; `qwen3.8:27b-mlx`
+  **65.6** / 13.8. **RAM (measured):** loading the MoE added **+20.4 GB** wired (Ollama
+  reports **SIZE 22 GB**); the dense 27B reports **18 GB**; both are GatedDeltaNet hybrids
+  whose KV is cheap (22 GB at both 8k and 32k ctx). **Conclusion:** the dense 27B is
+  *cheaper* in RAM but ~2× slower and, per P10, failed as an auto-writer — and the two
+  **cannot co-reside** (22 + 18 + ~2 helpers + ~10 OS ≈ 52 GB → swap), so "one heavy model
+  resident" is a hardware law, not a preference. The **35B-A3B MoE is the Pareto point** for
+  this workload (grounded instruction-following + JSON + moderate reasoning; not
+  coding/agentic). Helpers (nomic-embed-text · bge-reranker-base · nli-deberta-v3-base
+  ≈ 2.1 GB) stay; frontier opens (DeepSeek V4.1 Flash 552B, Kimi K3 2.8T, GLM-5.3-Flash,
+  Qwen3.8-Flash-Next 125B) are **not 48 GB-local** → remain on the DeepSeek online profile.
+  **Plan:** (1) check `qwen3.8:35b-a3b` (leaked in a ModelScope commit 2026-08-15); else
+  `ollama pull qwen3.6:35b-a3b` — a same-shape MoE (~3B active) with a better benchmark
+  record (GPQA 86.0, SWE-bench 73.4, AIME26 92.7) at ~the same speed. (2) A/B it against the
+  current MoE on `mentat2.eval.head2head`/`bench.py` (quality + latency + peak RAM, same
+  prompts/context). (3) On a win, add its profile to `models.json` and set
+  `MENTAT2_LOCAL_WRITER` (env, reversible); keep the old tag on disk as instant rollback; do
+  **not** change `gateway.py`/`registry.py` logic. (4) Leave `qwen3.8:27b-mlx` registered as
+  the opt-in picker/vision model; **no per-job dual-model routing** (RAM-unsafe; P10 showed
+  swaps hurt). (5) Re-verify the TRUTH targets (offline < 60 s warm, ≤ 34 GB) and record the
+  result. Optional later: MLX/DFlash speculative decoding (unproven here — P10 MTP gave no
+  gain; Lily reports −18% for this MoE).
+- 2026-10-01: **Performance + crash pass (same product, faster).** AppKit layout crash fixed
+  (window/appearance mutations deferred + change-only; `WindowAppearance` observers torn down;
+  uncaught-exception logger added). Sand light rendered at **half resolution** + cadence
+  **120/60/paused**; app persistence debounced, regexes cached, titlebar loop removed. Engine
+  (v2 only): **WAL + busy_timeout**, read-only v1 pragmas, embed keep-alive + online embed
+  warmup, batched claim lookup, cached route classification, Ollama timeout. No product change.
 - 2026-09-23: v2 built beside v1. Computed dialectic; one gateway, no silent fallbacks.
 - 2026-09-23: Reasoning-model budgeting + retry; `thinking:{type:disabled}` for cheap calls.
 - 2026-09-23: Grounding-repair loop; tolerant verifier; eval subsystem; Return fixed-point.

@@ -24,6 +24,15 @@ struct PaletteHost<Content: View>: View {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Record the *reason* of any uncaught ObjC exception (the crash reports
+        // don't carry it) so a future crash is diagnosable.
+        NSSetUncaughtExceptionHandler { ex in
+            let msg = "UNCAUGHT \(ex.name.rawValue): \(ex.reason ?? "(no reason)")\n"
+                + ex.callStackSymbols.joined(separator: "\n")
+            try? msg.write(toFile: "/tmp/mentat-exception.log", atomically: true,
+                           encoding: .utf8)
+            NSLog("Mentat uncaught exception: %@", msg)
+        }
         if let url = Bundle.main.url(forResource: "Quicksand", withExtension: "ttf") {
             CTFontManagerRegisterFontsForURL(url as CFURL, .process, nil)
         }

@@ -209,14 +209,24 @@ final class SandMotionStore {
 
     // MARK: Idle cadence
 
+    @ObservationIgnored private var idleDeadline: TimeInterval = 0
+
+    /// One reused task (not one per pointer/scroll event): each event only
+    /// extends the deadline. Avoids allocating a Task 60–120×/s while hovering.
     private func scheduleIdle(after deadline: TimeInterval) {
-        idleTask?.cancel()
-        let delay = max(0, deadline - CACurrentMediaTime())
+        idleDeadline = max(idleDeadline, deadline)
+        guard idleTask == nil else { return }
         idleTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-            guard let self, !Task.isCancelled else { return }
-            if CACurrentMediaTime() - self.lastEventAt >= self.idleWindow {
-                self.isActive = false
+            while true {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                guard let self, !Task.isCancelled else { return }
+                if CACurrentMediaTime() >= self.idleDeadline {
+                    if CACurrentMediaTime() - self.lastEventAt >= self.idleWindow {
+                        self.isActive = false
+                    }
+                    self.idleTask = nil
+                    return
+                }
             }
         }
     }

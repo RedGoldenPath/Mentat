@@ -22,6 +22,8 @@ BACKUP_DIR = PROJECT_ROOT / "backups"
 UV_BIN = "/Users/raphael/.local/bin/uv"
 LAUNCHD_PLIST = Path.home() / "Library" / "LaunchAgents" / "com.mentat.autoindex.plist"
 LEGACY_LAUNCHD_PLIST = Path.home() / "Library" / "LaunchAgents" / "com.secondbrain.autoindex.plist"
+WATCH_PLIST = Path.home() / "Library" / "LaunchAgents" / "com.mentat.watch.plist"
+WATCH_LOG = PROJECT_ROOT / "watch.log"
 
 console = Console()
 
@@ -41,6 +43,7 @@ COMMANDS = {
     "remember": 'permanently remember a fact: brain remember "fact" [--topic name]',
     "backup": "back up the index: brain backup | backup list | backup --restore <name>",
     "schedule": "auto-index on a timer: brain schedule on [--every 6] | off",
+    "watch": "index files the moment they land: brain watch on | off | status",
     "commands": "list all commands",
     "forget": "remove one file from the index: brain forget notes/foo.md",
     "reset": "delete the entire index (use --yes)",
@@ -871,6 +874,68 @@ async def cmd_schedule(args):
         print(json.dumps(_schedule_status(), indent=2))
 
 
+def _watch_watchdog_ok():
+    import importlib.util
+
+    return importlib.util.find_spec("watchdog") is not None
+
+
+def _watch_status():
+    listing = subprocess.run(["launchctl", "list"], capture_output=True, text=True).stdout
+    loaded = "com.mentat.watch" in listing
+    recent = ""
+    if WATCH_LOG.exists():
+        try:
+            recent = "\n".join(WATCH_LOG.read_text(errors="ignore").splitlines()[-5:])
+        except Exception:
+            recent = ""
+    return {
+        "configured": WATCH_PLIST.exists(),
+        "loaded": loaded,
+        "watchdog": _watch_watchdog_ok(),
+        "watch_root": str(KNOWLEDGE_ROOT),
+        "log": str(WATCH_LOG),
+        "recent": recent,
+    }
+
+
+def _watch_on():
+    if not _watch_watchdog_ok():
+        return {"ok": False, "error": "watchdog is not installed — run `uv add watchdog` in app/"}
+    command = f"cd {PROJECT_ROOT} && {UV_BIN} run python watch.py"
+    plist = {
+        "Label": "com.mentat.watch",
+        "ProgramArguments": ["/bin/zsh", "-lc", command],
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ThrottleInterval": 10,
+        "StandardOutPath": str(WATCH_LOG),
+        "StandardErrorPath": str(WATCH_LOG),
+    }
+    WATCH_PLIST.parent.mkdir(parents=True, exist_ok=True)
+    with open(WATCH_PLIST, "wb") as handle:
+        plistlib.dump(plist, handle)
+    subprocess.run(["launchctl", "unload", str(WATCH_PLIST)], capture_output=True)
+    subprocess.run(["launchctl", "load", str(WATCH_PLIST)], capture_output=True)
+    return {"ok": True, "watch_root": str(KNOWLEDGE_ROOT), "log": str(WATCH_LOG)}
+
+
+def _watch_off():
+    subprocess.run(["launchctl", "unload", str(WATCH_PLIST)], capture_output=True)
+    if WATCH_PLIST.exists():
+        WATCH_PLIST.unlink()
+    return {"ok": True}
+
+
+async def cmd_watch(args):
+    if args.action == "on":
+        print(json.dumps(_watch_on(), indent=2))
+    elif args.action == "off":
+        print(json.dumps(_watch_off(), indent=2))
+    else:
+        print(json.dumps(_watch_status(), indent=2))
+
+
 async def cmd_commands(args):
     console.print(_commands_table())
 
@@ -1182,6 +1247,9 @@ def main():
     schedule.add_argument("action", nargs="?", choices=["on", "off"], default=None)
     schedule.add_argument("--every", type=int, default=6, help="hours between runs (default 6)")
 
+    watch = subparsers.add_parser("watch", help="index files the moment they land (event-driven)")
+    watch.add_argument("action", nargs="?", choices=["on", "off"], default=None)
+
     subparsers.add_parser("commands", help="list all commands")
 
     forget = subparsers.add_parser("forget", help="remove one file from the index")
@@ -1259,6 +1327,8 @@ def main():
         asyncio.run(cmd_backup(args))
     elif command == "schedule":
         asyncio.run(cmd_schedule(args))
+    elif command == "watch":
+        asyncio.run(cmd_watch(args))
     elif command == "commands":
         asyncio.run(cmd_commands(args))
     elif command == "forget":

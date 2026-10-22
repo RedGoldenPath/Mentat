@@ -28,17 +28,14 @@ def claims_for_passages(passages, profile, model, max_score=None):
     if max_score is None:
         max_score = max((p.get("score") or 0.0) for p in passages) or 1.0
 
-    # split cached vs uncached, preserving order
+    # split cached vs uncached — ONE batched lookup, not one query per passage
     texts = {}
-    for p in passages:
-        cid = p.get("chunk_id")
-        if not cid:
-            continue
-        cached = store.load_claims_for_chunks([cid])
-        if cached:
-            texts[cid] = cached[0]["text"]
-        else:
-            texts.setdefault(cid, None)
+    cids = [p.get("chunk_id") for p in passages if p.get("chunk_id")]
+    loaded = {}
+    for row in store.load_claims_for_chunks(cids):
+        loaded.setdefault(row["chunk_id"], row["text"])
+    for cid in cids:
+        texts[cid] = loaded.get(cid)   # None → needs extraction
 
     todo = [p for p in passages if p.get("chunk_id") and texts.get(p.get("chunk_id")) is None]
     if todo:

@@ -1,0 +1,6 @@
+[
+  {"name": "newadvent-summa", "subject": "christianity", "root": "https://www.newadvent.org/summa/", "dest": "christianity/scholastic/aquinas-summa", "max": 4000},
+  {"name": "newadvent-fathers", "subject": "christianity", "root": "https://www.newadvent.org/fathers/", "dest": "christianity/patristics/antenicene-nicene-fathers", "max": 4000},
+  {"name": "newadvent-cathen", "subject": "christianity", "root": "https://www.newadvent.org/cathen/", "dest": "christianity/church-history/catholic-encyclopedia-1913", "max": 9000},
+  {"name": "newadvent-bible", "subject": "christianity", "root": "https://www.newadvent.org/bible/", "dest": "christianity/scripture/douay-rheims", "max": 3000}
+]

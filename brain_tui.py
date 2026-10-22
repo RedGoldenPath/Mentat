@@ -2200,7 +2200,7 @@ class MentatApp(App):
         try:
             from brain_core import _refresh_caches
 
-            _refresh_caches()
+            _refresh_caches(sync=True)
             self._refresh_status()
             self._refresh_history_sidebar()
             self._render_header()

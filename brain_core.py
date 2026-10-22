@@ -2350,8 +2350,10 @@ async def nomic_embed(texts, context="document", **kwargs):
         hit = _EMBED_CACHE.get(cache_key)
         if hit is not None:
             return hit
-    prefixes = {"document": "search_document: ", "query": "search_query: "}
-    prefix = prefixes.get(context)
+    # Nomic models want task prefixes; multilingual models (e.g. bge-m3) do not.
+    prefix = ""
+    if "nomic" in OLLAMA_EMBED_MODEL.lower():
+        prefix = {"document": "search_document: ", "query": "search_query: "}.get(context, "")
     if prefix:
         texts = [prefix + text for text in texts]
     client = _cached_ollama_client()
@@ -2408,11 +2410,13 @@ def _low_file_paths():
     return _LOW_FILE_PATHS
 
 
-def _refresh_caches():
+def _refresh_caches(sync: bool = False):
     """Drop in-memory caches so the next access re-reads from disk.
 
-    Used by /refresh to pick up changes made outside the running app
-    (a CLI index run, edited files, restored backups, etc.).
+    ``sync=True`` also force-rebuilds the FTS and vector stores (used by /refresh to
+    pick up changes made outside the running process). Indexing calls this WITHOUT
+    sync — per-file FTS/vec writes are already handled incrementally by
+    ``_fts_patch`` / ``_vec_insert_many``, so a full rebuild per file would be O(N^2).
     """
     global _CHUNK_TEXTS, _CHUNK_BY_ID, _LOW_FILE_PATHS, _CITATION_INDEX, _KNOWN_NAMES, _VOCAB, _VOCAB_KEY
     _CHUNK_TEXTS = None
@@ -2432,14 +2436,15 @@ def _refresh_caches():
         _LAST_ANSWER_PASSAGES.clear()
     except Exception:
         pass
-    try:
-        _fts_sync(force=True)
-    except Exception:
-        pass
-    try:
-        _vec_sync(force=True)
-    except Exception:
-        pass
+    if sync:
+        try:
+            _fts_sync(force=True)
+        except Exception:
+            pass
+        try:
+            _vec_sync(force=True)
+        except Exception:
+            pass
 
 
 LIBRARY_DB_PATH = STORAGE_DIR / "library.db"
@@ -2937,15 +2942,28 @@ def _vec_sync(force=False):
 
 
 def _vec_insert_many(ids, embeddings):
+    # sqlite-vec vec0 does NOT honour INSERT OR REPLACE on the chunk_id primary
+    # key — re-inserting an existing id raises "UNIQUE constraint failed on
+    # chunks_vec primary key" (and leaves the write txn half-open, which then
+    # wedges later commits on a lock). So dedupe within the batch, delete any
+    # pre-existing rows, then plain-insert.
     db = _vec_db()
-    rows = [
-        (str(cid), np.asarray(e, dtype=np.float32).reshape(-1).tobytes())
-        for cid, e in zip(ids, embeddings)
-    ]
-    db.executemany(
-        "INSERT OR REPLACE INTO chunks_vec (chunk_id, embedding) VALUES (?, ?)", rows
-    )
-    db.commit()
+    seen = {}
+    for cid, e in zip(ids, embeddings):
+        seen[str(cid)] = np.asarray(e, dtype=np.float32).reshape(-1).tobytes()
+    if not seen:
+        return
+    try:
+        ph = ",".join("?" * len(seen))
+        db.execute(f"DELETE FROM chunks_vec WHERE chunk_id IN ({ph})", list(seen))
+        db.executemany(
+            "INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, ?)",
+            list(seen.items()),
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
 
 def _vec_delete_many(ids):
@@ -8001,7 +8019,12 @@ def _get_reranker():
     if _RERANKER is None:
         from sentence_transformers import CrossEncoder
 
-        _RERANKER = CrossEncoder("BAAI/bge-reranker-base")
+        model = os.getenv("MENTAT_RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+        device = os.getenv("MENTAT_RERANKER_DEVICE", "mps")
+        try:
+            _RERANKER = CrossEncoder(model, device=device)
+        except Exception:
+            _RERANKER = CrossEncoder(model)
     return _RERANKER
 
 
@@ -9064,12 +9087,14 @@ def _ocr_page_text(page, dpi=200):
 def _extract_pdf(path):
     import pymupdf
 
+    # OCR off => index only PDFs with a real text layer; scans are deferred (not lost).
+    ocr = os.getenv("MENTAT_OCR", "on").strip().lower() not in ("off", "0", "false", "no")
     doc = pymupdf.open(str(path))
     try:
         parts = []
         for index, page in enumerate(doc, start=1):
             text = page.get_text().strip()
-            if not text:
+            if not text and ocr:
                 try:
                     text = _ocr_page_text(page)
                 except Exception:
@@ -9303,6 +9328,29 @@ def _load_manifest():
 def _save_manifest(manifest):
     MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
     MANIFEST_PATH.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+
+
+DEFERRED_OCR_PATH = STORAGE_DIR / "deferred_ocr.json"
+
+
+def _append_deferred(rels):
+    """Record PDFs skipped for OCR (no text layer) so a later OCR pass can pick them up.
+    Never silently drops a file."""
+    try:
+        existing = []
+        if DEFERRED_OCR_PATH.exists():
+            existing = json.loads(DEFERRED_OCR_PATH.read_text()) or []
+        merged = sorted(set(existing) | set(rels))
+        DEFERRED_OCR_PATH.write_text(json.dumps(merged, indent=2))
+    except Exception:
+        pass
+
+
+def _load_deferred():
+    try:
+        return json.loads(DEFERRED_OCR_PATH.read_text()) if DEFERRED_OCR_PATH.exists() else []
+    except Exception:
+        return []
 
 
 def _load_legacy_history():
@@ -10391,8 +10439,9 @@ class Brain:
             removed = [rel for rel in removed if rel.startswith(only)]
         return new_files, changed_files, removed, current
 
-    async def _insert_document(self, path, rel):
-        """Ingestion: stage -> chunk -> embed -> insert."""
+    def _prepare_pairs(self, path, rel):
+        """Stage + chunk a file into (pairs, doc_ids). No embedding. Raises on
+        unreadable/empty files so the caller can log/defer them."""
         docs = _staged_texts(path)
         if docs is None:
             docs = _stage_file(path)
@@ -10420,33 +10469,69 @@ class Brain:
             doc_id = _doc_id(rel)
             display = _clean_name(rel_display).replace("/", " › ")
             pairs = [
-                (
-                    f"{doc_id}-chunk-{i:03d}",
-                    display,
-                    chunk_text,
-                )
+                (f"{doc_id}-chunk-{i:03d}", display, chunk_text)
                 for i, chunk_text in enumerate(_split_text_chunks(text))
             ]
         if not pairs:
             raise ValueError("file produced no chunks")
-        await self._store_chunks(pairs)
-        return sorted({p[0].rsplit("-chunk-", 1)[0] for p in pairs})
+        doc_ids = sorted({p[0].rsplit("-chunk-", 1)[0] for p in pairs})
+        return pairs, doc_ids
 
-    async def _store_chunks(self, pairs):
-        """Embed + insert chunks into library.db, fts, and vec."""
-        ids = [p[0] for p in pairs]
-        texts = [p[2] for p in pairs]
-        embeddings = []
-        for start in range(0, len(texts), 20):
-            batch = texts[start : start + 20]
+    async def _insert_document(self, path, rel):
+        """Single-file ingestion (stage -> chunk -> embed -> insert)."""
+        pairs, doc_ids = self._prepare_pairs(path, rel)
+        kept, embs, _ = await self._embed_pairs(pairs)
+        if not kept:
+            raise RuntimeError("no embeddable chunks")
+        self._commit_pairs(kept, embs)
+        return doc_ids
+
+    async def _embed_pairs(self, flat, owner=None):
+        """Embed a flat list of (cid, fp, text) with big batches + concurrency, resilient.
+        Returns (kept_pairs, kept_embeddings, kept_owner) so callers can map back to files."""
+        owner = owner if owner is not None else [None] * len(flat)
+        out_p: list = []
+        out_e: list = []
+        out_o: list = []
+        lock = asyncio.Lock()
+        batch_size = int(os.getenv("MENTAT_EMBED_BATCH", "64"))
+        concurrency = max(1, int(os.getenv("MENTAT_EMBED_CONCURRENCY", "3")))
+        sem = asyncio.Semaphore(concurrency)
+
+        async def run(idxs):
+            if not idxs:
+                return
+            batch = [flat[i] for i in idxs]
             try:
-                emb = await nomic_embed(batch, context="document")
-                embeddings.extend(emb)
+                async with sem:
+                    embs = await nomic_embed([t for _, _, t in batch], context="document")
             except Exception:
-                raise RuntimeError("embedding failed")
+                if len(idxs) == 1:
+                    print(f"  ! unembeddable chunk skipped: {flat[idxs[0]][0]}", file=sys.stderr)
+                    return
+                mid = len(idxs) // 2
+                await run(idxs[:mid])
+                await run(idxs[mid:])
+                return
+            async with lock:
+                for i, e in zip(idxs, embs):
+                    out_p.append(flat[i])
+                    out_e.append(e)
+                    out_o.append(owner[i])
+
+        slices = [list(range(i, min(i + batch_size, len(flat))))
+                  for i in range(0, len(flat), batch_size)]
+        await asyncio.gather(*[run(s) for s in slices])
+        return out_p, out_e, out_o
+
+    def _commit_pairs(self, pairs, embeddings):
+        """Write already-embedded chunks into library.db, fts and vec."""
+        if not pairs:
+            return
+        ids = [p[0] for p in pairs]
         db = _library_db()
         rows = []
-        for (cid, fp, text), emb in zip(pairs, embeddings):
+        for (cid, fp, text) in pairs:
             book = fp.split(" · ", 1)[0]
             ch = re.search(r"\(ch(\d+)\)", fp)
             chapter = ch.group(1) if ch else ""
@@ -10461,15 +10546,17 @@ class Brain:
             rows,
         )
         db.commit()
-        _fts_patch(
-            [(cid, fp, text) for cid, fp, text in pairs],
-            delete_prefixes={cid.rsplit("-chunk-", 1)[0] for cid in ids},
-        )
+        if not os.getenv("MENTAT_INDEX_DEFER_FTS"):
+            _fts_patch(
+                [(cid, fp, text) for cid, fp, text in pairs],
+                delete_prefixes={cid.rsplit("-chunk-", 1)[0] for cid in ids},
+            )
         _vec_insert_many(ids, embeddings)
-        try:
-            _build_spans(chunk_ids=ids)
-        except Exception:
-            pass
+        if not os.getenv("MENTAT_INDEX_DEFER_SPANS"):
+            try:
+                _build_spans(chunk_ids=ids)
+            except Exception:
+                pass
         _refresh_caches()
 
     async def _delete_chunks_by_doc(self, doc_id):
@@ -10534,6 +10621,19 @@ class Brain:
             prog.reset(work)
             _active_progress = prog
 
+        ocr_off = os.getenv("MENTAT_OCR", "on").strip().lower() in ("off", "0", "false", "no")
+        idx_batch = max(8, int(os.getenv("MENTAT_INDEX_BATCH", "16")))
+        # Gentle-background knob: pause between groups so a bulk backlog doesn't
+        # peg the CPU/GPU (and spin the fans). 0 = full speed (manual runs).
+        idx_sleep = max(0.0, float(os.getenv("MENTAT_INDEX_SLEEP", "0")))
+        changed_set = {str(p.relative_to(KNOWLEDGE_ROOT)) for p in changed_files}
+        deferred: list = []
+        processed: list = []
+
+        def _is_defer(exc, path):
+            return (ocr_off and Path(path).suffix.lower() == ".pdf"
+                    and "no extractable text" in str(exc))
+
         try:
             for rel in removed:
                 try:
@@ -10544,43 +10644,74 @@ class Brain:
                 except Exception as exc:
                     stats["errors"].append(f"{rel}: {exc}")
 
-            for path in changed_files:
-                rel = str(path.relative_to(KNOWLEDGE_ROOT))
-                try:
-                    for doc_id in (_entry_docs(manifest.get(rel)) or [_doc_id(rel)]):
-                        await self._delete_chunks_by_doc(doc_id)
-                    doc_ids = await self._insert_document(path, rel)
-                    manifest[rel] = {"hash": current[rel], "docs": doc_ids}
-                    stats["updated"] += 1
-                    if prog:
-                        prog.file_done(rel)
-                        prog.clear()
-                    if verbose:
-                        print(f"updated: {rel}")
-                        sys.stdout.flush()
-                except Exception as exc:
-                    stats["errors"].append(f"{rel}: {exc}")
-
-            for path in new_files:
-                rel = str(path.relative_to(KNOWLEDGE_ROOT))
-                try:
-                    doc_ids = await self._insert_document(path, rel)
-                    manifest[rel] = {"hash": current[rel], "docs": doc_ids}
-                    stats["indexed"] += 1
-                    if prog:
-                        prog.file_done(rel)
-                        prog.clear()
-                    if verbose:
-                        print(f"indexed: {rel}")
-                        sys.stdout.flush()
-                except Exception as exc:
-                    stats["errors"].append(f"{rel}: {exc}")
+            # Cross-file batching: prepare a group of files, embed ALL their chunks in
+            # one stream of big batches, then commit per file. Resumable: the manifest
+            # is checkpointed after every group.
+            todo = list(changed_files) + list(new_files)
+            # Bound a single run so a bulk backlog can't grind for hours in the
+            # background (0 = unlimited; a foreground `brain index` leaves it 0).
+            max_files = int(os.getenv("MENTAT_INDEX_MAX_FILES", "0"))
+            if max_files > 0 and len(todo) > max_files:
+                todo = todo[:max_files]
+            for start in range(0, len(todo), idx_batch):
+                group = todo[start:start + idx_batch]
+                prepared = []
+                for path in group:
+                    rel = str(path.relative_to(KNOWLEDGE_ROOT))
+                    try:
+                        pairs, doc_ids = await asyncio.to_thread(self._prepare_pairs, path, rel)
+                        prepared.append((rel, pairs, doc_ids))
+                    except Exception as exc:
+                        if _is_defer(exc, path):
+                            deferred.append(rel)
+                            if verbose:
+                                print(f"deferred (ocr): {rel}")
+                                sys.stdout.flush()
+                        else:
+                            stats["errors"].append(f"{rel}: {exc}")
+                if prepared:
+                    flat, owner = [], []
+                    for rel, pairs, _ in prepared:
+                        for p in pairs:
+                            flat.append(p)
+                            owner.append(rel)
+                    kept, embs, ko = await self._embed_pairs(flat, owner)
+                    by_rel: dict = {}
+                    for p, e, r in zip(kept, embs, ko):
+                        by_rel.setdefault(r, []).append((p, e))
+                    for rel, pairs, doc_ids in prepared:
+                        items = by_rel.get(rel, [])
+                        if not items:
+                            stats["errors"].append(f"{rel}: no embeddable chunks")
+                            continue
+                        try:
+                            self._commit_pairs([p for p, _ in items], [e for _, e in items])
+                            manifest[rel] = {"hash": current[rel], "docs": doc_ids}
+                            if rel in changed_set:
+                                stats["updated"] += 1
+                            else:
+                                stats["indexed"] += 1
+                            processed.append(rel)
+                            if prog:
+                                prog.file_done(rel)
+                                prog.clear()
+                            if verbose:
+                                print(f"{'updated' if rel in changed_set else 'indexed'}: {rel}")
+                                sys.stdout.flush()
+                        except Exception as exc:
+                            stats["errors"].append(f"{rel}: {exc}")
+                _save_manifest(manifest)  # incremental checkpoint -> a kill loses at most one group
+                if idx_sleep:
+                    await asyncio.sleep(idx_sleep)
         finally:
             if prog:
                 prog.finish()
                 _active_progress = None
+            _save_manifest(manifest)
 
-        _save_manifest(manifest)
+        stats["deferred_ocr"] = deferred
+        if deferred:
+            _append_deferred(deferred)
 
         # One full FTS reconciliation per batch (per-file maintenance is now
         # incremental via _fts_patch) — cheap insurance against edge cases.
@@ -10592,7 +10723,6 @@ class Brain:
 
         # Canary checks for the files we just indexed: verify each new/changed
         # book is actually retrievable before declaring success.
-        processed = {str(p.relative_to(KNOWLEDGE_ROOT)) for p in (new_files + changed_files)}
         canary = []
         for rel in processed:
             try:

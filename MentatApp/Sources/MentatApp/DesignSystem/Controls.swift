@@ -99,7 +99,14 @@ struct AppearanceModifier: ViewModifier {
     }
 
     private func apply() {
-        NSApp.appearance = NSAppearance(named: isDark ? .darkAqua : .aqua)
+        // Never mutate global appearance *during* a SwiftUI layout/display pass —
+        // AppKit throws from `_postWindowNeedsUpdateConstraints` and the app dies
+        // (EXC_BREAKPOINT, `_crashOnException`). Defer to the next runloop and only
+        // touch it when the value actually changed. Same pattern as HideTrafficLights.
+        let name: NSAppearance.Name = isDark ? .darkAqua : .aqua
+        DispatchQueue.main.async {
+            if NSApp.appearance?.name != name { NSApp.appearance = NSAppearance(named: name) }
+        }
     }
 }
 
@@ -114,22 +121,33 @@ extension View {
 struct TopInsetReader: NSViewRepresentable {
     var onChange: (CGFloat) -> Void
 
+    final class Coordinator { var last: CGFloat? }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
     func makeNSView(context: Context) -> NSView {
         let v = NSView()
-        DispatchQueue.main.async { report(v) }
+        DispatchQueue.main.async { report(v, context.coordinator) }
         return v
     }
 
     func updateNSView(_ v: NSView, context: Context) {
-        DispatchQueue.main.async { report(v) }
+        // Report only when the value actually changes — reporting on *every*
+        // update wrote `engine.topInset` (an @Observable) unconditionally, which
+        // re-invalidated the view graph and looped forever (redraw storm + crash
+        // window). Guarded + change-only here.
+        DispatchQueue.main.async { report(v, context.coordinator) }
     }
 
-    private func report(_ v: NSView) {
+    private func report(_ v: NSView, _ coord: Coordinator) {
         guard let w = v.window else { return }
         let safe = w.contentView?.safeAreaInsets.top ?? 0
         // A hidden-titlebar window often reports 0, so fall back to the standard
         // traffic-light band height (Apple's ~28pt) rather than clipping.
-        onChange(safe > 1 ? safe : 28)
+        let value: CGFloat = safe > 1 ? safe : 28
+        guard coord.last != value else { return }
+        coord.last = value
+        onChange(value)
     }
 }
 
@@ -180,5 +198,12 @@ struct WindowAppearance: NSViewRepresentable {
         let coord = context.coordinator
         coord.isDark = isDark
         DispatchQueue.main.async { MainActor.assumeIsolated { coord.apply(to: v) } }
+    }
+
+    static func dismantleNSView(_ v: NSView, coordinator: Coordinator) {
+        // Remove the NotificationCenter observers — otherwise they (and the
+        // coordinator) leak for the app's lifetime.
+        for o in coordinator.observers { NotificationCenter.default.removeObserver(o) }
+        coordinator.observers.removeAll()
     }
 }

@@ -4,7 +4,7 @@ import Observation
 /// Owns the live `LayoutGrid`, persisted to UserDefaults and kept in sync with
 /// the legacy grid `@AppStorage` keys so the existing feather + numeric inspector
 /// keep working while the armature becomes the authority.
-@Observable final class LayoutGridStore {
+@MainActor @Observable final class LayoutGridStore {
     private static let key = "layoutGrid"
 
     var grid: LayoutGrid {
@@ -43,11 +43,20 @@ import Observation
     /// Put the armature back to the built-in default.
     func reset() { grid = .default }
 
+    @ObservationIgnored private var persistTask: Task<Void, Never>?
+
+    /// Debounced — dragging a guide fired a full encode + 5 legacy writes per
+    /// frame. Coalesce to one write after the drag settles.
     private func persist() {
-        if let data = try? JSONEncoder().encode(grid) {
-            UserDefaults.standard.set(data, forKey: Self.key)
+        persistTask?.cancel()
+        persistTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            guard !Task.isCancelled, let self else { return }
+            if let data = try? JSONEncoder().encode(self.grid) {
+                UserDefaults.standard.set(data, forKey: Self.key)
+            }
+            self.grid.writeLegacyDefaults()
         }
-        grid.writeLegacyDefaults()
     }
 }
 

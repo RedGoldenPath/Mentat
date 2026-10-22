@@ -53,7 +53,7 @@ Primitive → semantic → component; aliases resolve (`bubble.fill = {color.sur
 - **material** · `MaterialRole` = `material·tonal·outline·solid·glass`; default `.tonal`
 - **shadow** · `flat,low,mid,high` (composite)
 - **motion** · `smooth,snappy,bubble,stagger,ambient,parallax` + reduce-motion
-- **sand** · `enabled, intensity, waveScale, warp, drift, grain, scrim, ambient, wander, grainFlow, colorShift, idleWindow, impulseScale`
+- **sand** · the dust + light system (exact set + model in [`SandCore/TRUTH.md`](SandCore/TRUTH.md)): motion (`swirl · swirlScale · drift · drag · brownian · parallaxDepth`), obstacles (`obstacleRadius · obstaclePad`), dust (`dustCount · dustSize · dustFog · dustBase · dustBrightness`), beams (`shaftStrength/X/Y/Spread/Rays/Falloff/SourceGlow/Drift/Bg · beamFlutter · beamFlutterSpeed · goboStrength · goboScale · goboDrift · gustAmount · gustRate · lightSway · lightLean`), volumetric (`volSteps · volDensity · volExtinction · volScale · volDrift · volJitter · taaAlpha`), layers (`layerClose · layerNear · layerMid · layerFar · layerHaze`), look (`bloomIntensity · bloomThreshold · bloomIterations · dither · exposure · tonemap`), cadence (`idleWindow · impulseScale`)
 - **layers** · `art<scrim<content<chrome<overlay<cursor`
 
 Persisted as **W3C `.tokens.json`** with the native `DesignTokens` blob as the fast cache.
@@ -114,6 +114,23 @@ persist · generative) are values. The engine's **data** lives in effect service
 
 ## 7 · Decisions log
 
+- 2026-10-01 · **Performance + crash pass (same product, faster).** No interface/look
+  change. **Crash root cause:** the detail `ZStack` had `.animation(Anim.snappy, value:
+  inspectorStore.visible)` wrapping a `GeometryReader` that wrote `sandFrame` (`@State`) on
+  every global-frame change — so an animated layout ran around a geometry-driven state write,
+  re-entering AppKit and throwing from `_postWindowNeedsUpdateConstraints`
+  (`EXC_BREAKPOINT`). Fix: **scope the animation to the chat+inspector `HStack` only**, and
+  keep the sand frame in a **non-observed box** (`SandFrameBox`) so it never invalidates the
+  tree; plus deferred + change-only window/appearance writes (`AppearanceModifier`,
+  `TopInsetReader`, `WindowAppearance` + observer teardown) and an uncaught-exception logger.
+  `MessageRow` no longer reads `engine.contentSize` (passed in) so resizes don't re-render
+  every row. Sand: the light renders at **half resolution**
+  (upscaled), bloom rebuilds on level change, dead `beamAt` removed, cadence **120 interacting /
+  60 rest / paused** (never 30). App: settings persistence **debounced**, compiled regexes
+  cached, the titlebar-inset redraw loop removed, one reused idle task. Engine: v2 **WAL +
+  `busy_timeout`**, read-only v1 pragmas, embeds keep-alive + online embed warmup, one
+  batched claim lookup, cached route classification, Ollama timeout. Docs also reconciled
+  (the `sand` token list above was stale).
 - 2026-09-25 · **UX.md created** as the interface source of truth, parallel to TRUTH/ARCHITECTURE.
 - 2026-09-25 · **Living sand** — the surface never rests. An ambient clock travels two broad
   amber masses across the frame; the amber↔deep-orange transition follows the domain-warp

@@ -51,21 +51,23 @@ Owner: Raphael · Machine: Apple M5 Max, 48 GB RAM · Offline-first.
   column) — `TextStyle.measure` as `column-width` (CSS Multi-column).
 - **Sand surface (`DesignSystem/Sand/`)** — the procedural canvas behind the reading text,
   and the app's only background. A Metal fragment shader (`SandShaders.metal`) draws
-  near-black + two **broad amber masses that travel the frame and cross-fade to deep-orange**
-  — the colour transition follows the domain-warp field's own velocity (Inigo Quilez), so it
-  reads organic, not like a flat sine. **Fine grain is advected along the warp field**
-  (`gp = pos − dir·(grainFlow·t)`), so it streams with the dunes like wind-blown sand rather
-  than boiling like TV static. Plus a centre scrim and an in-shader **dither** that kills 8-bit
-  banding. `SandStyle` (look) + `SandMotion` (couplings) → `SandCanvas`.
+  near-black with **dust in five parallax depth layers** lit by a fan of **crepuscular light
+  beams** from one source (a moving big/small noise field — light through a cloud), plus a
+  haze band, bloom, and an in-shader **dither** that kills 8-bit banding. The light is the
+  only light source for the dust (a mote lights up inside a beam). `SandStyle` (look) +
+  `SandMotion` (couplings) → `SandCanvas`. **The sand doctrine is
+  [`SandCore/TRUTH.md`](SandCore/TRUTH.md)** — read that for the model.
   **It is always alive.** An ambient clock (`at = time·ambient`) drives the travel; motion is
   a sum of decaying impulses (`SandMotionStore`, `exp(-dt/τ)`) on top — framerate-free,
   interruptible. Events arrive through the `\.sandMotion` environment seam (`SandEvent`: send ·
   panel · scroll · modeChange · resize · pulse) with an **amplitude ladder**: pointer/scroll are
   tiny, panels/send/mode are bigger — calm by default, surging on big moves, never fully still.
   The store is `@MainActor @Observable`; only the sand leaf reads it, so hover/scroll never
-  invalidate the transcript. **Cadence adapts** (60 fps while active → 30 fps at rest → paused
-  under Reduce Motion / inactive scene / Low Power). The shader uses an integer-bit hash (no
-  transcendentals) and 3-octave fBm; it falls back to a Canvas approximation when the library is
+  invalidate the transcript. **Cadence adapts** (120 fps while interacting → 60 fps at rest →
+  paused under Reduce Motion / inactive scene / Low Power; never 30). The light is a **single
+  pass at half resolution**, upscaled (soft, so no visible loss) — the dominant GPU cost after
+  the earlier march/supersample/TAA removal; the dust runs five depth layers (Close-up · Near ·
+  Mid · Far · Haze). The shader falls back to a Canvas approximation when the library is
   absent, so dev builds/tests never go blank. Compilation is a **`build.sh`** step
   (`SandShaders.metal` → `default.metallib` in `Contents/Resources`, found by
   `ShaderLibrary.default`), so SwiftPM never sees the `.metal`. Needs the Metal Toolchain

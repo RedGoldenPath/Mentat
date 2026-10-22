@@ -1,0 +1,21 @@
+[
+  {"name": "islam", "dest": "islam/_gutenberg", "queries": [
+    "Rumi", "Masnavi", "Ibn Arabi", "Al-Ghazali", "Ghazali", "Farid al-Din Attar",
+    "Saadi Gulistan", "Hafiz Divan", "Omar Khayyam", "Avicenna", "Al-Biruni",
+    "Quran", "Koran", "Islam", "sufism", "Sufi", "Mohammed", "Islamic mysticism",
+    "Arabian nights", "Ibn Khaldun"
+  ]},
+  {"name": "catholic", "dest": "christianity/_gutenberg", "queries": [
+    "Augustine", "City of God", "Confessions Augustine", "Thomas Aquinas", "Summa Theologica",
+    "Dante Divine Comedy", "Thomas a Kempis", "Imitation of Christ", "Teresa of Avila",
+    "John of the Cross", "Francis de Sales", "Anselm", "Bernard of Clairvaux",
+    "Julian of Norwich", "Catherine of Siena", "Thomas More", "Erasmus", "Catholic",
+    "church history", "lives of the saints", "Douay Rheims", "Eusebius", "Bede"
+  ]},
+  {"name": "contemplative", "dest": "contemplative/_gutenberg", "queries": [
+    "Meister Eckhart", "Eckhart sermons", "Cloud of Unknowing", "Pseudo-Dionysius",
+    "Jacob Boehme", "Ruysbroeck", "mysticism", "Christian mysticism", "contemplative",
+    "negative theology", "Thomas a Kempis", "John of the Cross", "Teresa of Avila",
+    "Rumi", "Sufi mysticism", "theologia germanica", "Richard Rolle", "Walter Hilton"
+  ]}
+]
